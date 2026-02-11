@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import PIL
 import torch
+from torch.profiler import profile, record_function, ProfilerActivity
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
 from ...loaders import Flux2LoraLoaderMixin
@@ -703,215 +704,266 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             `return_dict` is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the
             generated images.
         """
+        # Start Profiling Context
+        import os
+        print(f"I am running in: {os.getcwd()}")
+        print(f"I am looking for logs at: {os.path.join(os.getcwd(), 'log', 'flux2_profile')}")
+        with torch.profiler.profile(
+            activities=[
+                ProfilerActivity.CPU,
+                ProfilerActivity.CUDA,
+            ],
+            # -----------------------------------------------------------------
+            # CRITICAL FIX: REMOVE the 'schedule' parameter completely!
+            # -----------------------------------------------------------------
+            # schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=1), 
+            
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/flux2_profile'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        ) as prof:
 
-        # 1. Check inputs. Raise error if not correct
-        self.check_inputs(
-            prompt=prompt,
-            height=height,
-            width=width,
-            prompt_embeds=prompt_embeds,
-            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
-            guidance_scale=guidance_scale,
-        )
+            # 1. Check inputs
+            with record_function("1_check_inputs"):
+                self.check_inputs(
+                    prompt=prompt,
+                    height=height,
+                    width=width,
+                    prompt_embeds=prompt_embeds,
+                    callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+                    guidance_scale=guidance_scale,
+                )
 
-        self._guidance_scale = guidance_scale
-        self._attention_kwargs = attention_kwargs
-        self._current_timestep = None
-        self._interrupt = False
+                self._guidance_scale = guidance_scale
+                self._attention_kwargs = attention_kwargs
+                self._current_timestep = None
+                self._interrupt = False
 
-        # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
+            # 2. Define call parameters
+            if prompt is not None and isinstance(prompt, str):
+                batch_size = 1
+            elif prompt is not None and isinstance(prompt, list):
+                batch_size = len(prompt)
+            else:
+                batch_size = prompt_embeds.shape[0]
 
-        device = self._execution_device
+            device = self._execution_device
 
-        # 3. prepare text embeddings
-        prompt_embeds, text_ids = self.encode_prompt(
-            prompt=prompt,
-            prompt_embeds=prompt_embeds,
-            device=device,
-            num_images_per_prompt=num_images_per_prompt,
-            max_sequence_length=max_sequence_length,
-            text_encoder_out_layers=text_encoder_out_layers,
-        )
-
-        if self.do_classifier_free_guidance:
-            negative_prompt = ""
-            if prompt is not None and isinstance(prompt, list):
-                negative_prompt = [negative_prompt] * len(prompt)
-            negative_prompt_embeds, negative_text_ids = self.encode_prompt(
-                prompt=negative_prompt,
-                prompt_embeds=negative_prompt_embeds,
-                device=device,
-                num_images_per_prompt=num_images_per_prompt,
-                max_sequence_length=max_sequence_length,
-                text_encoder_out_layers=text_encoder_out_layers,
-            )
-
-        # 4. process images
-        if image is not None and not isinstance(image, list):
-            image = [image]
-
-        condition_images = None
-        if image is not None:
-            for img in image:
-                self.image_processor.check_image_input(img)
-
-            condition_images = []
-            for img in image:
-                image_width, image_height = img.size
-                if image_width * image_height > 1024 * 1024:
-                    img = self.image_processor._resize_to_target_area(img, 1024 * 1024)
-                    image_width, image_height = img.size
-
-                multiple_of = self.vae_scale_factor * 2
-                image_width = (image_width // multiple_of) * multiple_of
-                image_height = (image_height // multiple_of) * multiple_of
-                img = self.image_processor.preprocess(img, height=image_height, width=image_width, resize_mode="crop")
-                condition_images.append(img)
-                height = height or image_height
-                width = width or image_width
-
-        height = height or self.default_sample_size * self.vae_scale_factor
-        width = width or self.default_sample_size * self.vae_scale_factor
-
-        # 5. prepare latent variables
-        num_channels_latents = self.transformer.config.in_channels // 4
-        latents, latent_ids = self.prepare_latents(
-            batch_size=batch_size * num_images_per_prompt,
-            num_latents_channels=num_channels_latents,
-            height=height,
-            width=width,
-            dtype=prompt_embeds.dtype,
-            device=device,
-            generator=generator,
-            latents=latents,
-        )
-
-        image_latents = None
-        image_latent_ids = None
-        if condition_images is not None:
-            image_latents, image_latent_ids = self.prepare_image_latents(
-                images=condition_images,
-                batch_size=batch_size * num_images_per_prompt,
-                generator=generator,
-                device=device,
-                dtype=self.vae.dtype,
-            )
-
-        # 6. Prepare timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-        if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
-            sigmas = None
-        image_seq_len = latents.shape[1]
-        mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
-            num_inference_steps,
-            device,
-            sigmas=sigmas,
-            mu=mu,
-        )
-        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
-        self._num_timesteps = len(timesteps)
-
-        # 7. Denoising loop
-        # We set the index here to remove DtoH sync, helpful especially during compilation.
-        # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
-        self.scheduler.set_begin_index(0)
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-
-                self._current_timestep = t
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
-
-                latent_model_input = latents.to(self.transformer.dtype)
-                latent_image_ids = latent_ids
-
-                if image_latents is not None:
-                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
-                    latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
-
-                with self.transformer.cache_context("cond"):
-                    noise_pred = self.transformer(
-                        hidden_states=latent_model_input,  # (B, image_seq_len, C)
-                        timestep=timestep / 1000,
-                        guidance=None,
-                        encoder_hidden_states=prompt_embeds,
-                        txt_ids=text_ids,  # B, text_seq_len, 4
-                        img_ids=latent_image_ids,  # B, image_seq_len, 4
-                        joint_attention_kwargs=self.attention_kwargs,
-                        return_dict=False,
-                    )[0]
-
-                noise_pred = noise_pred[:, : latents.size(1) :]
+            # 3. Prepare text embeddings
+            with record_function("3_encode_prompt"):
+                prompt_embeds, text_ids = self.encode_prompt(
+                    prompt=prompt,
+                    prompt_embeds=prompt_embeds,
+                    device=device,
+                    num_images_per_prompt=num_images_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                    text_encoder_out_layers=text_encoder_out_layers,
+                )
 
                 if self.do_classifier_free_guidance:
-                    with self.transformer.cache_context("uncond"):
-                        neg_noise_pred = self.transformer(
-                            hidden_states=latent_model_input,
-                            timestep=timestep / 1000,
-                            guidance=None,
-                            encoder_hidden_states=negative_prompt_embeds,
-                            txt_ids=negative_text_ids,
-                            img_ids=latent_image_ids,
-                            joint_attention_kwargs=self._attention_kwargs,
-                            return_dict=False,
-                        )[0]
-                    neg_noise_pred = neg_noise_pred[:, : latents.size(1) :]
-                    noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+                    negative_prompt = ""
+                    if prompt is not None and isinstance(prompt, list):
+                        negative_prompt = [negative_prompt] * len(prompt)
+                    negative_prompt_embeds, negative_text_ids = self.encode_prompt(
+                        prompt=negative_prompt,
+                        prompt_embeds=negative_prompt_embeds,
+                        device=device,
+                        num_images_per_prompt=num_images_per_prompt,
+                        max_sequence_length=max_sequence_length,
+                        text_encoder_out_layers=text_encoder_out_layers,
+                    )
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents_dtype = latents.dtype
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            # 4. Process images
+            with record_function("4_process_images"):
+                if image is not None and not isinstance(image, list):
+                    image = [image]
 
-                if latents.dtype != latents_dtype:
-                    if torch.backends.mps.is_available():
-                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
-                        latents = latents.to(latents_dtype)
+                condition_images = None
+                if image is not None:
+                    for img in image:
+                        self.image_processor.check_image_input(img)
 
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    condition_images = []
+                    for img in image:
+                        image_width, image_height = img.size
+                        if image_width * image_height > 1024 * 1024:
+                            img = self.image_processor._resize_to_target_area(img, 1024 * 1024)
+                            image_width, image_height = img.size
 
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                        multiple_of = self.vae_scale_factor * 2
+                        image_width = (image_width // multiple_of) * multiple_of
+                        image_height = (image_height // multiple_of) * multiple_of
+                        img = self.image_processor.preprocess(img, height=image_height, width=image_width, resize_mode="crop")
+                        condition_images.append(img)
+                        height = height or image_height
+                        width = width or image_width
 
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
+            height = height or self.default_sample_size * self.vae_scale_factor
+            width = width or self.default_sample_size * self.vae_scale_factor
 
-                if XLA_AVAILABLE:
-                    xm.mark_step()
+            # 5. Prepare latent variables
+            with record_function("5_prepare_latents"):
+                num_channels_latents = self.transformer.config.in_channels // 4
+                latents, latent_ids = self.prepare_latents(
+                    batch_size=batch_size * num_images_per_prompt,
+                    num_latents_channels=num_channels_latents,
+                    height=height,
+                    width=width,
+                    dtype=prompt_embeds.dtype,
+                    device=device,
+                    generator=generator,
+                    latents=latents,
+                )
 
-        self._current_timestep = None
+                image_latents = None
+                image_latent_ids = None
+                if condition_images is not None:
+                    image_latents, image_latent_ids = self.prepare_image_latents(
+                        images=condition_images,
+                        batch_size=batch_size * num_images_per_prompt,
+                        generator=generator,
+                        device=device,
+                        dtype=self.vae.dtype,
+                    )
 
-        latents = self._unpack_latents_with_ids(latents, latent_ids)
+            # 6. Prepare timesteps
+            with record_function("6_prepare_timesteps"):
+                sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+                if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
+                    sigmas = None
+                image_seq_len = latents.shape[1]
+                mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
+                timesteps, num_inference_steps = retrieve_timesteps(
+                    self.scheduler,
+                    num_inference_steps,
+                    device,
+                    sigmas=sigmas,
+                    mu=mu,
+                )
+                num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+                self._num_timesteps = len(timesteps)
 
-        latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
-        latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
-            latents.device, latents.dtype
-        )
-        latents = latents * latents_bn_std + latents_bn_mean
-        latents = self._unpatchify_latents(latents)
-        if output_type == "latent":
-            image = latents
-        else:
-            image = self.vae.decode(latents, return_dict=False)[0]
-            image = self.image_processor.postprocess(image, output_type=output_type)
+            # 7. Denoising loop
+            self.scheduler.set_begin_index(0)
+            with self.progress_bar(total=num_inference_steps) as progress_bar:
+                with record_function("7_denoising_loop"):
+                    for i, t in enumerate(timesteps):
+                        # Use a nested record_function to see per-step costs
+                        with record_function(f"transformer_step_{i}"):
+                            if self.interrupt:
+                                continue
 
-        # Offload all models
-        self.maybe_free_model_hooks()
+                            self._current_timestep = t
+                            timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
+                            latent_model_input = latents.to(self.transformer.dtype)
+                            latent_image_ids = latent_ids
+
+                            if image_latents is not None:
+                                latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
+                                latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
+
+                            with self.transformer.cache_context("cond"):
+                                noise_pred = self.transformer(
+                                    hidden_states=latent_model_input,
+                                    timestep=timestep / 1000,
+                                    guidance=None,
+                                    encoder_hidden_states=prompt_embeds,
+                                    txt_ids=text_ids,
+                                    img_ids=latent_image_ids,
+                                    joint_attention_kwargs=self.attention_kwargs,
+                                    return_dict=False,
+                                )[0]
+
+                            noise_pred = noise_pred[:, : latents.size(1) :]
+
+                            if self.do_classifier_free_guidance:
+                                with self.transformer.cache_context("uncond"):
+                                    neg_noise_pred = self.transformer(
+                                        hidden_states=latent_model_input,
+                                        timestep=timestep / 1000,
+                                        guidance=None,
+                                        encoder_hidden_states=negative_prompt_embeds,
+                                        txt_ids=negative_text_ids,
+                                        img_ids=latent_image_ids,
+                                        joint_attention_kwargs=self._attention_kwargs,
+                                        return_dict=False,
+                                    )[0]
+                                neg_noise_pred = neg_noise_pred[:, : latents.size(1) :]
+                                noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+
+                            latents_dtype = latents.dtype
+                            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                            if latents.dtype != latents_dtype:
+                                if torch.backends.mps.is_available():
+                                    latents = latents.to(latents_dtype)
+
+                            if callback_on_step_end is not None:
+                                callback_kwargs = {}
+                                for k in callback_on_step_end_tensor_inputs:
+                                    callback_kwargs[k] = locals()[k]
+                                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                                latents = callback_outputs.pop("latents", latents)
+                                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
+                            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                                progress_bar.update()
+
+                            if XLA_AVAILABLE:
+                                xm.mark_step()
+
+            self._current_timestep = None
+
+            # 8. Decode Latents
+            with record_function("8_decode_latents"):
+                latents = self._unpack_latents_with_ids(latents, latent_ids)
+
+                latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+                latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(
+                    latents.device, latents.dtype
+                )
+                latents = latents * latents_bn_std + latents_bn_mean
+                latents = self._unpatchify_latents(latents)
+                if output_type == "latent":
+                    image = latents
+                else:
+                    image = self.vae.decode(latents, return_dict=False)[0]
+                    image = self.image_processor.postprocess(image, output_type=output_type)
+
+            self.maybe_free_model_hooks()
+
+            # Mark the step to finalize the profiling record
+            # prof.step()
+        key_avgs = prof.key_averages()
+
+        # Define the labels you actually care about
+        my_labels = [
+            "1_check_inputs", 
+            "3_encode_prompt", 
+            "4_process_images", 
+            "5_prepare_latents", 
+            "6_prepare_timesteps", 
+            "7_denoising_loop", 
+            "8_decode_latents"
+        ]
+
+        # Print a custom clean table
+        print(f"{'Stage Name':<25} | {'CUDA Time':<12} | {'% of Total'}")
+        print("-" * 55)
+
+        # total_time = sum(item.cuda_time_total for item in key_avgs if item.key in my_labels)
+
+        for item in key_avgs:
+            if item.key in my_labels:
+                print(item)
+            #     percent = (item.cuda_time_total / total_time) * 100 if total_time > 0 else 0
+            #     # Convert microseconds to seconds/milliseconds for readability
+            #     time_str = f"{item.cuda_time_total / 1e6:.3f}s" 
+            #     print(f"{item.key:<25} | {time_str:<12} | {percent:.1f}%")
+        
         if not return_dict:
             return (image,)
 
