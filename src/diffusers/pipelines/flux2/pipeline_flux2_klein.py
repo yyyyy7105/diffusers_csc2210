@@ -14,6 +14,7 @@
 
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from contextlib import nullcontext
 
 import numpy as np
 import PIL
@@ -185,6 +186,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         tokenizer: Qwen2TokenizerFast,
         transformer: Flux2Transformer2DModel,
         is_distilled: bool = False,
+        enable_profiler: bool = False
     ):
         super().__init__()
 
@@ -204,6 +206,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self.image_processor = Flux2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
         self.tokenizer_max_length = 512
         self.default_sample_size = 128
+        
+        self.enable_profiler = enable_profiler
+        self.register_to_config(enable_profiler=enable_profiler)
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -604,7 +609,48 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
     @property
     def interrupt(self):
         return self._interrupt
+    
+    def _get_profiler(self):
+        """
+        Return the profiler if enabled.
+        """
+        if self.enable_profiler:
+            return profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/flux2_profile'),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True
+            )
+        return nullcontext()
 
+    def _record(self, name):
+        """
+        Return recorder used by profiler if enabled
+        """
+        return record_function(name) if self.enable_profiler else nullcontext()
+    
+    def _report_profiler_stats(self, prof):
+        """
+        Print profiling if enabled
+        """
+        if not self.enable_profiler or prof is None:
+            return
+        print(prof)
+        key_avgs = prof.key_averages()
+        my_labels = [
+            "1_check_inputs", "3_encode_prompt", "4_process_images",
+            "5_prepare_latents", "6_prepare_timesteps", "7_denoising_loop",
+            "8_decode_latents"
+        ]
+
+        print(f"\n{'Stage Name':<25} | {'CUDA Time':<12} | {'% of Total'}")
+        print("-" * 55)
+
+        for item in key_avgs:
+            if item.key in my_labels:
+                print(item)
+    
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -708,24 +754,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         import os
         print(f"I am running in: {os.getcwd()}")
         print(f"I am looking for logs at: {os.path.join(os.getcwd(), 'log', 'flux2_profile')}")
-        with torch.profiler.profile(
-            activities=[
-                ProfilerActivity.CPU,
-                ProfilerActivity.CUDA,
-            ],
-            # -----------------------------------------------------------------
-            # CRITICAL FIX: REMOVE the 'schedule' parameter completely!
-            # -----------------------------------------------------------------
-            # schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=1), 
-            
-            on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/flux2_profile'),
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True
-        ) as prof:
+        with self._get_profiler() as prof:
 
             # 1. Check inputs
-            with record_function("1_check_inputs"):
+            with self._record("1_check_inputs"):
                 self.check_inputs(
                     prompt=prompt,
                     height=height,
@@ -751,7 +783,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             device = self._execution_device
 
             # 3. Prepare text embeddings
-            with record_function("3_encode_prompt"):
+            with self._record("3_encode_prompt"):
                 prompt_embeds, text_ids = self.encode_prompt(
                     prompt=prompt,
                     prompt_embeds=prompt_embeds,
@@ -775,7 +807,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                     )
 
             # 4. Process images
-            with record_function("4_process_images"):
+            with self._record("4_process_images"):
                 if image is not None and not isinstance(image, list):
                     image = [image]
 
@@ -803,7 +835,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             width = width or self.default_sample_size * self.vae_scale_factor
 
             # 5. Prepare latent variables
-            with record_function("5_prepare_latents"):
+            with self._record("5_prepare_latents"):
                 num_channels_latents = self.transformer.config.in_channels // 4
                 latents, latent_ids = self.prepare_latents(
                     batch_size=batch_size * num_images_per_prompt,
@@ -828,7 +860,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                     )
 
             # 6. Prepare timesteps
-            with record_function("6_prepare_timesteps"):
+            with self._record("6_prepare_timesteps"):
                 sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
                 if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
                     sigmas = None
@@ -847,10 +879,10 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             # 7. Denoising loop
             self.scheduler.set_begin_index(0)
             with self.progress_bar(total=num_inference_steps) as progress_bar:
-                with record_function("7_denoising_loop"):
+                with self._record("7_denoising_loop"):
                     for i, t in enumerate(timesteps):
-                        # Use a nested record_function to see per-step costs
-                        with record_function(f"transformer_step_{i}"):
+                        # Use a nested self._record to see per-step costs
+                        with self._record(f"transformer_step_{i}"):
                             if self.interrupt:
                                 continue
 
@@ -918,7 +950,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             self._current_timestep = None
 
             # 8. Decode Latents
-            with record_function("8_decode_latents"):
+            with self._record("8_decode_latents"):
                 latents = self._unpack_latents_with_ids(latents, latent_ids)
 
                 latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
@@ -935,34 +967,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
             self.maybe_free_model_hooks()
 
-            # Mark the step to finalize the profiling record
-            # prof.step()
-        key_avgs = prof.key_averages()
-
-        # Define the labels you actually care about
-        my_labels = [
-            "1_check_inputs", 
-            "3_encode_prompt", 
-            "4_process_images", 
-            "5_prepare_latents", 
-            "6_prepare_timesteps", 
-            "7_denoising_loop", 
-            "8_decode_latents"
-        ]
-
-        # Print a custom clean table
-        print(f"{'Stage Name':<25} | {'CUDA Time':<12} | {'% of Total'}")
-        print("-" * 55)
-
-        # total_time = sum(item.cuda_time_total for item in key_avgs if item.key in my_labels)
-
-        for item in key_avgs:
-            if item.key in my_labels:
-                print(item)
-            #     percent = (item.cuda_time_total / total_time) * 100 if total_time > 0 else 0
-            #     # Convert microseconds to seconds/milliseconds for readability
-            #     time_str = f"{item.cuda_time_total / 1e6:.3f}s" 
-            #     print(f"{item.key:<25} | {time_str:<12} | {percent:.1f}%")
+        self._report_profiler_stats(prof)
         
         if not return_dict:
             return (image,)
