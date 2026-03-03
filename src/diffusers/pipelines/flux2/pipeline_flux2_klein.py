@@ -208,6 +208,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         self.default_sample_size = 128
         
         self.enable_profiler = enable_profiler
+        self.profile = None
         self.register_to_config(enable_profiler=enable_profiler)
 
     @staticmethod
@@ -623,21 +624,24 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 with_stack=True
             )
         return nullcontext()
-
+    
+    def get_profile(self):
+        return self.profile
+    
     def _record(self, name):
         """
         Return recorder used by profiler if enabled
         """
         return record_function(name) if self.enable_profiler else nullcontext()
     
-    def _report_profiler_stats(self, prof):
+    def _report_profiler_stats(self):
         """
         Print profiling if enabled
         """
-        if not self.enable_profiler or prof is None:
+        if not self.enable_profiler or self.profile is None:
             return
-        print(prof)
-        key_avgs = prof.key_averages()
+        print(self.profile)
+        key_avgs = self.profile.key_averages()
         my_labels = [
             "1_check_inputs", "3_encode_prompt", "4_process_images",
             "5_prepare_latents", "6_prepare_timesteps", "7_denoising_loop",
@@ -967,7 +971,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
             self.maybe_free_model_hooks()
 
-        self._report_profiler_stats(prof)
+        self._report_profiler_stats()
         
         if not return_dict:
             return (image,)
