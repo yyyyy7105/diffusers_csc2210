@@ -759,7 +759,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         print(f"I am running in: {os.getcwd()}")
         print(f"I am looking for logs at: {os.path.join(os.getcwd(), 'log', 'flux2_profile')}")
         with self._get_profiler() as prof:
-
+            self.profile = prof
             # 1. Check inputs
             with self._record("1_check_inputs"):
                 self.check_inputs(
