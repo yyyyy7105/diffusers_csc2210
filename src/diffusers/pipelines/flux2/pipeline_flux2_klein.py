@@ -636,28 +636,32 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         return record_function(name) if self.enable_profiler else nullcontext()
     
     def _report_profiler_stats(self):
-        """
-        Print profiling if enabled
-        """
         if not self.enable_profiler or self.profile is None:
             return
-        # print(self.profile)
-        key_avgs = self.profile.key_averages()
+
         my_labels = [
             "1_check_inputs", "3_encode_prompt", "4_process_images",
             "5_prepare_latents", "6_prepare_timesteps", "7_denoising_loop",
             "8_decode_latents"
         ]
 
-        print(f"\n{'Stage Name':<25} | {'CUDA Time':<12} | {'% of Total'}")
-        print("-" * 55)
+        print(f"\n{'Component Name':<35} | {'Parent':<20} | {'CPU Total':<12} | {'CUDA Total'}")
+        print("-" * 90)
 
-        for item in key_avgs:
-            if item.key in my_labels:
-                print(item)
-        
-        print(key_avgs.table(sort_by="cpu_time_total", row_limit=100))
-        print(key_avgs.table(sort_by="cuda_time_total", row_limit=100))
+        # Use .events() to preserve the tree structure
+        for event in self.profile.events():
+            # Identify if the event is one of your stages or a direct child of one
+            is_stage = event.name in my_labels
+            is_child = event.parent and event.parent.name in my_labels
+            
+            if is_stage or is_child:
+                parent_name = event.parent.name if event.parent else "ROOT"
+                cpu_t = f"{event.cpu_time_total / 1000:.2f}ms"
+                cuda_t = f"{event.cuda_time_total / 1000:.2f}ms"
+                
+                # Indent children for better scannability
+                display_name = f"  -> {event.name}" if is_child else event.name
+                print(f"{display_name:<35} | {parent_name:<20} | {cpu_t:<12} | {cuda_t}")
                 
     def clear_gpu_cache(self):
         if not self.enable_profiler:
