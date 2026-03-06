@@ -210,11 +210,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         
         self.enable_profiler = enable_profiler
         self.profile = None
-        self.profile_event_names = [
-            "1_check_inputs", "3_encode_prompt", "4_process_images",
-            "5_prepare_latents", "6_prepare_timesteps", "7_denoising_loop",
-            "8_decode_latents"
-        ]
+        self.profile_event_names = []
         self.register_to_config(enable_profiler=enable_profiler)
 
     @staticmethod
@@ -638,7 +634,11 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         """
         Return recorder used by profiler if enabled
         """
-        return record_function(name) if self.enable_profiler else nullcontext()
+        if not self.enable_profiler:
+            return nullcontext()
+        
+        self.profile_event_names.append(name)
+        return record_function(name)
     
     def _report_profiler_stats(self):
         """
@@ -648,13 +648,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             return
         # print(self.profile)
         key_avgs = self.profile.key_averages()
-        my_labels = self.profile_event_names
-
+        
         print(f"\n{'Stage Name':<25} | {'CUDA Time':<12} | {'% of Total'}")
         print("-" * 55)
 
         for item in key_avgs:
-            if item.key in my_labels:
+            if item.key in self.profile_event_names:
                 print(item)
         
         print(key_avgs.table(sort_by="cpu_time_total", row_limit=100))
@@ -901,7 +900,6 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
             self.clear_gpu_cache()
             
-            self.profile_event_names += [f"transformer_step_{i}" for i in range(len(timesteps))]
             # 7. Denoising loop
             self.scheduler.set_begin_index(0)
             with self.progress_bar(total=num_inference_steps) as progress_bar:
