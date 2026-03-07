@@ -21,6 +21,7 @@ import numpy as np
 import PIL
 import torch
 from torch.profiler import profile, record_function, ProfilerActivity
+from torch.autograd.profiler import EventList
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
 from ...loaders import Flux2LoraLoaderMixin
@@ -649,13 +650,14 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         # print(self.profile)
         key_avgs = self.profile.key_averages()
         
-        print(f"\n{'Stage Name':<25} | {'CUDA Time':<12} | {'% of Total'}")
-        print("-" * 55)
-
+        recorded_events = []
         for item in key_avgs:
             if item.key in self.profile_event_names:
-                print(item)
-        
+                # print(item)
+                recorded_events.append(item)
+                
+        print("Recorded Events")
+        print(EventList(recorded_events).table())
         print(key_avgs.table(sort_by="cpu_time_total", row_limit=100))
         print(key_avgs.table(sort_by="cuda_time_total", row_limit=100))
                 
