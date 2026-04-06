@@ -15,11 +15,13 @@
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from contextlib import nullcontext
+import gc
 
 import numpy as np
 import PIL
 import torch
 from torch.profiler import profile, record_function, ProfilerActivity
+from torch.autograd.profiler import EventList
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
 from ...loaders import Flux2LoraLoaderMixin
@@ -209,6 +211,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         
         self.enable_profiler = enable_profiler
         self.profile = None
+        self.profile_event_names = []
         self.register_to_config(enable_profiler=enable_profiler)
 
     @staticmethod
@@ -620,8 +623,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/flux2_profile'),
                 record_shapes=True,
-                profile_memory=True,
-                with_stack=True
+                profile_memory=False,
+                with_stack=False
             )
         return nullcontext()
     
@@ -632,7 +635,11 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         """
         Return recorder used by profiler if enabled
         """
-        return record_function(name) if self.enable_profiler else nullcontext()
+        if not self.enable_profiler:
+            return nullcontext()
+        
+        self.profile_event_names.append(name)
+        return record_function(name)
     
     def _report_profiler_stats(self):
         """
@@ -640,20 +647,31 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         """
         if not self.enable_profiler or self.profile is None:
             return
-        print(self.profile)
+        # print(self.profile)
         key_avgs = self.profile.key_averages()
-        my_labels = [
-            "1_check_inputs", "3_encode_prompt", "4_process_images",
-            "5_prepare_latents", "6_prepare_timesteps", "7_denoising_loop",
-            "8_decode_latents"
-        ]
-
-        print(f"\n{'Stage Name':<25} | {'CUDA Time':<12} | {'% of Total'}")
-        print("-" * 55)
-
+        
+        recorded_events = []
         for item in key_avgs:
-            if item.key in my_labels:
-                print(item)
+            if item.key in self.profile_event_names:
+                # print(item)
+                recorded_events.append(item)
+                
+        print("Recorded Events")
+        print(EventList(recorded_events).table())
+        print(key_avgs.table(sort_by="cpu_time_total", row_limit=100))
+        print(key_avgs.table(sort_by="cuda_time_total", row_limit=100))
+                
+    def clear_gpu_cache(self):
+        if not self.enable_profiler:
+            return
+        
+        # 1. Clear the Python garbage collector to delete unreferenced objects
+        gc.collect()
+        # 2. Free up the PyTorch cached memory (the 'reserved' memory)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # Optional: reset peak memory stats for the next profiler run
+            torch.cuda.reset_peak_memory_stats()
     
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -759,7 +777,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         print(f"I am running in: {os.getcwd()}")
         print(f"I am looking for logs at: {os.path.join(os.getcwd(), 'log', 'flux2_profile')}")
         with self._get_profiler() as prof:
-
+            self.profile = prof
             # 1. Check inputs
             with self._record("1_check_inputs"):
                 self.check_inputs(
@@ -786,6 +804,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
 
             device = self._execution_device
 
+            self.clear_gpu_cache()
+            
             # 3. Prepare text embeddings
             with self._record("3_encode_prompt"):
                 prompt_embeds, text_ids = self.encode_prompt(
@@ -880,6 +900,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
                 self._num_timesteps = len(timesteps)
 
+            self.clear_gpu_cache()
+            
             # 7. Denoising loop
             self.scheduler.set_begin_index(0)
             with self.progress_bar(total=num_inference_steps) as progress_bar:

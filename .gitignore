@@ -181,4 +181,7 @@ tags
 wandb
 
 # images
-.png
+*.png
+
+# Profiler Logs
+log/
