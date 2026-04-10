@@ -271,15 +271,18 @@ class AttentionProfilingStore:
         log_weights = torch.log(attn_f32.clamp(min=1e-10))
         entropy = -(attn_f32 * log_weights).sum(dim=-1)  # [B, H, S]
         per_head_entropy = entropy.mean(dim=(0, 2)).detach().cpu()  # [H]
+        del attn_f32, log_weights, entropy
 
         # Per-head sparsity: fraction of weights below threshold
         sparse_mask = attn_weights < self.sparsity_threshold
         per_head_sparsity = sparse_mask.float().mean(dim=(0, 2, 3)).detach().cpu()  # [H]
+        del sparse_mask
 
         # Top-k concentration: fraction of total attention in top-k keys per query
         topk_vals, _ = attn_weights.topk(min(self.topk, S), dim=-1)  # [B, H, S, k]
         topk_sum = topk_vals.sum(dim=-1)  # [B, H, S] — sum is out of 1.0 per query
         per_head_topk = topk_sum.mean(dim=(0, 2)).detach().cpu()  # [H]
+        del topk_vals, topk_sum
 
         # Locality profile for I→I quadrant: average attention as a function of spatial distance.
         # Image tokens are laid out in raster order on a 2D grid. We compute the Manhattan distance
@@ -314,6 +317,11 @@ class AttentionProfilingStore:
                         profile[d] = ii_attn[mask].mean()
                         counts[d] = mask.sum()
                 ii_locality_profile = profile.detach().cpu()
+                del dist, ii_attn, profile, counts
+
+        # Save full weights to CPU before releasing GPU tensor
+        full_attention_weights = attn_weights.detach().cpu().to(torch.float16) if self.store_full_weights else None
+        del attn_weights
 
         entry = AttentionProfileEntry(
             block_type=block_type,
@@ -331,7 +339,7 @@ class AttentionProfilingStore:
             ii_locality_profile=ii_locality_profile,
             image_grid_h=grid_h,
             image_grid_w=grid_w,
-            full_attention_weights=attn_weights.detach().cpu().to(torch.float16) if self.store_full_weights else None,
+            full_attention_weights=full_attention_weights,
         )
         return entry
 
@@ -357,6 +365,7 @@ class AttentionProfilingStore:
             # Compute attention scores: [B, H, S_q, S_k]
             attn_scores = torch.einsum("bshd,bthd->bhst", query, key) * scale
             attn_weights = F.softmax(attn_scores, dim=-1)
+            del attn_scores
 
             entry = self._compute_metrics(
                 attn_weights=attn_weights,
