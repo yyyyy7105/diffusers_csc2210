@@ -203,6 +203,13 @@ class AttentionProfileEntry:
     per_head_sparsity: Optional[torch.Tensor] = None
     # Top-k concentration (fraction of total attention captured by top-k), shape [H]
     per_head_topk_concentration: Optional[torch.Tensor] = None
+    # Locality profile for I→I quadrant: mean attention weight at each spatial distance.
+    # locality_profile[d] = average attention weight for image token pairs that are d pixels apart
+    # (using Manhattan distance on the 2D grid). Shape: [max_distance+1]
+    ii_locality_profile: Optional[torch.Tensor] = None
+    # The height and width of the image grid used for locality computation
+    image_grid_h: int = 0
+    image_grid_w: int = 0
     # Full attention weights (only stored if requested, can be very large)
     full_attention_weights: Optional[torch.Tensor] = None
 
@@ -259,9 +266,10 @@ class AttentionProfilingStore:
         mean_ii = attn_weights[:, :, t:, t:].mean().item() if num_image_tokens > 0 else 0.0
 
         # Per-head entropy: -sum(p * log(p)) averaged across batch and query positions
-        # Clamp to avoid log(0)
-        log_weights = torch.log(attn_weights.clamp(min=1e-10))
-        entropy = -(attn_weights * log_weights).sum(dim=-1)  # [B, H, S]
+        # Upcast to float32 to avoid NaN from float16 underflow (1e-10 is below fp16 range)
+        attn_f32 = attn_weights.float()
+        log_weights = torch.log(attn_f32.clamp(min=1e-10))
+        entropy = -(attn_f32 * log_weights).sum(dim=-1)  # [B, H, S]
         per_head_entropy = entropy.mean(dim=(0, 2)).detach().cpu()  # [H]
 
         # Per-head sparsity: fraction of weights below threshold
@@ -272,6 +280,40 @@ class AttentionProfilingStore:
         topk_vals, _ = attn_weights.topk(min(self.topk, S), dim=-1)  # [B, H, S, k]
         topk_sum = topk_vals.sum(dim=-1)  # [B, H, S] — sum is out of 1.0 per query
         per_head_topk = topk_sum.mean(dim=(0, 2)).detach().cpu()  # [H]
+
+        # Locality profile for I→I quadrant: average attention as a function of spatial distance.
+        # Image tokens are laid out in raster order on a 2D grid. We compute the Manhattan distance
+        # between every pair of image positions and bin the mean attention weight by distance.
+        ii_locality_profile = None
+        grid_h, grid_w = 0, 0
+        if num_image_tokens > 1:
+            # Infer 2D grid dimensions (assume roughly square, raster-order image tokens)
+            grid_h = int(math.isqrt(num_image_tokens))
+            grid_w = num_image_tokens // grid_h if grid_h > 0 else 0
+            if grid_h * grid_w == num_image_tokens and grid_h > 0:
+                # Build position arrays for image tokens
+                rows = torch.arange(grid_h, device=attn_weights.device)
+                cols = torch.arange(grid_w, device=attn_weights.device)
+                grid_rows = rows.repeat_interleave(grid_w)  # [num_image_tokens]
+                grid_cols = cols.repeat(grid_h)              # [num_image_tokens]
+
+                # Manhattan distance between all pairs of image positions
+                dist = (grid_rows.unsqueeze(1) - grid_rows.unsqueeze(0)).abs() + \
+                       (grid_cols.unsqueeze(1) - grid_cols.unsqueeze(0)).abs()  # [N_img, N_img]
+                max_dist = int(dist.max().item())
+
+                # Extract I→I attention, averaged over batch and heads
+                ii_attn = attn_weights[:, :, t:, t:].float().mean(dim=(0, 1))  # [N_img, N_img]
+
+                # Bin by distance
+                profile = torch.zeros(max_dist + 1, device=attn_weights.device)
+                counts = torch.zeros(max_dist + 1, device=attn_weights.device)
+                for d in range(max_dist + 1):
+                    mask = dist == d
+                    if mask.any():
+                        profile[d] = ii_attn[mask].mean()
+                        counts[d] = mask.sum()
+                ii_locality_profile = profile.detach().cpu()
 
         entry = AttentionProfileEntry(
             block_type=block_type,
@@ -286,6 +328,9 @@ class AttentionProfilingStore:
             per_head_entropy=per_head_entropy,
             per_head_sparsity=per_head_sparsity,
             per_head_topk_concentration=per_head_topk,
+            ii_locality_profile=ii_locality_profile,
+            image_grid_h=grid_h,
+            image_grid_w=grid_w,
             full_attention_weights=attn_weights.detach().cpu().to(torch.float16) if self.store_full_weights else None,
         )
         return entry
