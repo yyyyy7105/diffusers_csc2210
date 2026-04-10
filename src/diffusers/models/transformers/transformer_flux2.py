@@ -222,7 +222,7 @@ class AttentionProfilingStore:
     current_block_type: str = ""
     current_block_index: int = 0
     # Track the number of text tokens for single-stream blocks
-    _current_num_text_tokens: int = 0
+    current_num_text_tokens: int = 0
 
     def clear(self):
         self.entries.clear()
@@ -453,7 +453,7 @@ class Flux2ProfilingSelfAttnProcessor:
         # The num_text_tokens is tracked by the profiling store's current state
         # (set by Flux2Transformer2DModel.forward before this block runs).
         if self.profiling_store is not None:
-            self.profiling_store.record(query, key, self.profiling_store._current_num_text_tokens)
+            self.profiling_store.record(query, key, self.profiling_store.current_num_text_tokens)
 
         hidden_states = dispatch_attention_fn(
             query,
@@ -1242,7 +1242,7 @@ class Flux2Transformer2DModel(
             if profiling_store.enabled:
                 profiling_store.current_block_type = "single"
                 profiling_store.current_block_index = index_block
-                profiling_store._current_num_text_tokens = num_txt_tokens
+                profiling_store.current_num_text_tokens = num_txt_tokens
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states = self._gradient_checkpointing_func(
                     block,
