@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import inspect
+import math
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -179,6 +181,299 @@ class Flux2AttnProcessor:
             return hidden_states, encoder_hidden_states
         else:
             return hidden_states
+
+
+@dataclass
+class AttentionProfileEntry:
+    """Stores profiling metrics for a single attention layer at a single timestep."""
+
+    block_type: str  # "double" or "single"
+    block_index: int
+    timestep: float
+    num_text_tokens: int
+    num_image_tokens: int
+    # Quadrant-level mean attention weights
+    mean_weight_tt: float = 0.0  # text→text
+    mean_weight_ti: float = 0.0  # text→image
+    mean_weight_it: float = 0.0  # image→text
+    mean_weight_ii: float = 0.0  # image→image
+    # Per-head entropy: mean across query positions, shape [H]
+    per_head_entropy: Optional[torch.Tensor] = None
+    # Per-head sparsity (fraction of weights < threshold), shape [H]
+    per_head_sparsity: Optional[torch.Tensor] = None
+    # Top-k concentration (fraction of total attention captured by top-k), shape [H]
+    per_head_topk_concentration: Optional[torch.Tensor] = None
+    # Full attention weights (only stored if requested, can be very large)
+    full_attention_weights: Optional[torch.Tensor] = None
+
+
+@dataclass
+class AttentionProfilingStore:
+    """Shared storage for attention profiling data across all blocks and timesteps."""
+
+    entries: List[AttentionProfileEntry] = field(default_factory=list)
+    enabled: bool = False
+    store_full_weights: bool = False
+    sparsity_threshold: float = 0.01
+    topk: int = 32
+    # Track the current timestep (set by the model's forward method)
+    current_timestep: float = 0.0
+    # Track the current block index (set by the model's forward method)
+    current_block_type: str = ""
+    current_block_index: int = 0
+    # Track the number of text tokens for single-stream blocks
+    current_num_text_tokens: int = 0
+
+    def clear(self):
+        self.entries.clear()
+
+    def _compute_metrics(
+        self,
+        attn_weights: torch.Tensor,
+        num_text_tokens: int,
+        block_type: str,
+        block_index: int,
+        timestep: float,
+    ) -> AttentionProfileEntry:
+        """Compute profiling metrics from attention weights.
+
+        Args:
+            attn_weights: [B, H, S, S] attention weight tensor (after softmax).
+            num_text_tokens: Number of text tokens in the sequence.
+            block_type: "double" or "single".
+            block_index: Index of the block.
+            timestep: Current denoising timestep.
+        """
+        B, H, S, _ = attn_weights.shape
+        num_image_tokens = S - num_text_tokens
+        t = num_text_tokens
+
+        # Quadrant mean attention weights
+        # attn_weights[:, :, :t, :t] = text→text (T→T)
+        # attn_weights[:, :, :t, t:] = text→image (T→I)
+        # attn_weights[:, :, t:, :t] = image→text (I→T)
+        # attn_weights[:, :, t:, t:] = image→image (I→I)
+        mean_tt = attn_weights[:, :, :t, :t].mean().item() if t > 0 else 0.0
+        mean_ti = attn_weights[:, :, :t, t:].mean().item() if t > 0 and num_image_tokens > 0 else 0.0
+        mean_it = attn_weights[:, :, t:, :t].mean().item() if t > 0 and num_image_tokens > 0 else 0.0
+        mean_ii = attn_weights[:, :, t:, t:].mean().item() if num_image_tokens > 0 else 0.0
+
+        # Per-head entropy: -sum(p * log(p)) averaged across batch and query positions
+        # Clamp to avoid log(0)
+        log_weights = torch.log(attn_weights.clamp(min=1e-10))
+        entropy = -(attn_weights * log_weights).sum(dim=-1)  # [B, H, S]
+        per_head_entropy = entropy.mean(dim=(0, 2)).detach().cpu()  # [H]
+
+        # Per-head sparsity: fraction of weights below threshold
+        sparse_mask = attn_weights < self.sparsity_threshold
+        per_head_sparsity = sparse_mask.float().mean(dim=(0, 2, 3)).detach().cpu()  # [H]
+
+        # Top-k concentration: fraction of total attention in top-k keys per query
+        topk_vals, _ = attn_weights.topk(min(self.topk, S), dim=-1)  # [B, H, S, k]
+        topk_sum = topk_vals.sum(dim=-1)  # [B, H, S] — sum is out of 1.0 per query
+        per_head_topk = topk_sum.mean(dim=(0, 2)).detach().cpu()  # [H]
+
+        entry = AttentionProfileEntry(
+            block_type=block_type,
+            block_index=block_index,
+            timestep=timestep,
+            num_text_tokens=num_text_tokens,
+            num_image_tokens=num_image_tokens,
+            mean_weight_tt=mean_tt,
+            mean_weight_ti=mean_ti,
+            mean_weight_it=mean_it,
+            mean_weight_ii=mean_ii,
+            per_head_entropy=per_head_entropy,
+            per_head_sparsity=per_head_sparsity,
+            per_head_topk_concentration=per_head_topk,
+            full_attention_weights=attn_weights.detach().cpu().to(torch.float16) if self.store_full_weights else None,
+        )
+        return entry
+
+    def record(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        num_text_tokens: int,
+    ):
+        """Compute attention weights from Q, K and record profiling metrics.
+
+        Args:
+            query: [B, S, H, D] query tensor (after RoPE, before dispatch).
+            key: [B, S, H, D] key tensor (after RoPE, before dispatch).
+            num_text_tokens: Number of text tokens at the start of the sequence.
+        """
+        if not self.enabled:
+            return
+
+        with torch.no_grad():
+            # query/key shape: [B, S, H, D]
+            scale = 1.0 / math.sqrt(query.shape[-1])
+            # Compute attention scores: [B, H, S_q, S_k]
+            attn_scores = torch.einsum("bshd,bthd->bhst", query, key) * scale
+            attn_weights = F.softmax(attn_scores, dim=-1)
+
+            entry = self._compute_metrics(
+                attn_weights=attn_weights,
+                num_text_tokens=num_text_tokens,
+                block_type=self.current_block_type,
+                block_index=self.current_block_index,
+                timestep=self.current_timestep,
+            )
+            self.entries.append(entry)
+
+
+class Flux2ProfilingAttnProcessor:
+    """Profiling variant of Flux2AttnProcessor for double-stream joint attention blocks.
+
+    Computes and records attention weight metrics while using the efficient SDPA path
+    for the actual forward computation. The model output is identical to Flux2AttnProcessor.
+    """
+
+    _attention_backend = None
+    _parallel_config = None
+
+    def __init__(self, profiling_store: Optional[AttentionProfilingStore] = None):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(f"{self.__class__.__name__} requires PyTorch 2.0.")
+        self.profiling_store = profiling_store
+
+    def __call__(
+        self,
+        attn: "Flux2Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        num_text_tokens = 0
+        if attn.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+
+            encoder_query = attn.norm_added_q(encoder_query)
+            encoder_key = attn.norm_added_k(encoder_key)
+
+            num_text_tokens = encoder_query.shape[1]
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        # Record attention weights for profiling (detached, no grad)
+        if self.profiling_store is not None:
+            self.profiling_store.record(query, key, num_text_tokens)
+
+        # Use the efficient dispatch path for the actual computation
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            backend=self._attention_backend,
+            parallel_config=self._parallel_config,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            )
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if encoder_hidden_states is not None:
+            return hidden_states, encoder_hidden_states
+        else:
+            return hidden_states
+
+
+class Flux2ProfilingSelfAttnProcessor:
+    """Profiling variant of Flux2ParallelSelfAttnProcessor for single-stream self-attention blocks.
+
+    Computes and records attention weight metrics while using the efficient SDPA path
+    for the actual forward computation. The model output is identical to Flux2ParallelSelfAttnProcessor.
+    """
+
+    _attention_backend = None
+    _parallel_config = None
+
+    def __init__(self, profiling_store: Optional[AttentionProfilingStore] = None):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(f"{self.__class__.__name__} requires PyTorch 2.0.")
+        self.profiling_store = profiling_store
+
+    def __call__(
+        self,
+        attn: "Flux2ParallelSelfAttention",
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Parallel in (QKV + MLP in) projection
+        hidden_states = attn.to_qkv_mlp_proj(hidden_states)
+        qkv, mlp_hidden_states = torch.split(
+            hidden_states, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
+        )
+
+        # Handle the attention logic
+        query, key, value = qkv.chunk(3, dim=-1)
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        # Record attention weights for profiling (detached, no grad)
+        # For single-stream blocks, text tokens are concatenated at the front.
+        # The num_text_tokens is tracked by the profiling store's current state
+        # (set by Flux2Transformer2DModel.forward before this block runs).
+        if self.profiling_store is not None:
+            self.profiling_store.record(query, key, self.profiling_store.current_num_text_tokens)
+
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            backend=self._attention_backend,
+            parallel_config=self._parallel_config,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        # Handle the feedforward (FF) logic
+        mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
+
+        # Concatenate and parallel output projection
+        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+        hidden_states = attn.to_out(hidden_states)
+
+        return hidden_states
 
 
 class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
@@ -774,6 +1069,57 @@ class Flux2Transformer2DModel(
 
         self.gradient_checkpointing = False
 
+        # Attention profiling store (disabled by default)
+        self._attention_profiling_store = AttentionProfilingStore()
+
+    def set_profiling_mode(
+        self,
+        enabled: bool,
+        store_full_weights: bool = False,
+        sparsity_threshold: float = 0.01,
+        topk: int = 32,
+    ):
+        """Enable or disable attention profiling on all attention modules.
+
+        When enabled, attention processors are swapped to profiling variants that capture
+        attention weight metrics at each block and timestep. The model output is unchanged.
+
+        Args:
+            enabled: Whether to enable profiling.
+            store_full_weights: If True, store full [B, H, S, S] attention weights (very memory-intensive).
+            sparsity_threshold: Threshold below which an attention weight is considered "sparse".
+            topk: Number of top keys to consider for top-k concentration metric.
+        """
+        store = self._attention_profiling_store
+        store.enabled = enabled
+        store.store_full_weights = store_full_weights
+        store.sparsity_threshold = sparsity_threshold
+        store.topk = topk
+        store.clear()
+
+        if enabled:
+            # Swap processors to profiling variants
+            for block in self.transformer_blocks:
+                block.attn.set_processor(Flux2ProfilingAttnProcessor(profiling_store=store))
+            for block in self.single_transformer_blocks:
+                block.attn.set_processor(Flux2ProfilingSelfAttnProcessor(profiling_store=store))
+            logger.info("Attention profiling enabled on all blocks.")
+        else:
+            # Restore standard processors
+            for block in self.transformer_blocks:
+                block.attn.set_processor(Flux2AttnProcessor())
+            for block in self.single_transformer_blocks:
+                block.attn.set_processor(Flux2ParallelSelfAttnProcessor())
+            logger.info("Attention profiling disabled. Standard processors restored.")
+
+    def get_attention_profile_data(self) -> List[AttentionProfileEntry]:
+        """Return the list of captured attention profile entries."""
+        return self._attention_profiling_store.entries
+
+    def clear_attention_profile_data(self):
+        """Clear all captured attention profile data."""
+        self._attention_profiling_store.clear()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -827,6 +1173,12 @@ class Flux2Transformer2DModel(
 
         num_txt_tokens = encoder_hidden_states.shape[1]
 
+        # Set up attention profiling context
+        profiling_store = self._attention_profiling_store
+        if profiling_store.enabled:
+            # Store the normalized timestep (before the ×1000 scaling)
+            profiling_store.current_timestep = timestep.item() if timestep.numel() == 1 else timestep[0].item()
+
         # 1. Calculate timestep embedding and modulation parameters
         timestep = timestep.to(hidden_states.dtype) * 1000
 
@@ -860,6 +1212,9 @@ class Flux2Transformer2DModel(
 
         # 4. Double Stream Transformer Blocks
         for index_block, block in enumerate(self.transformer_blocks):
+            if profiling_store.enabled:
+                profiling_store.current_block_type = "double"
+                profiling_store.current_block_index = index_block
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
                     block,
@@ -884,6 +1239,10 @@ class Flux2Transformer2DModel(
 
         # 5. Single Stream Transformer Blocks
         for index_block, block in enumerate(self.single_transformer_blocks):
+            if profiling_store.enabled:
+                profiling_store.current_block_type = "single"
+                profiling_store.current_block_index = index_block
+                profiling_store.current_num_text_tokens = num_txt_tokens
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states = self._gradient_checkpointing_func(
                     block,
