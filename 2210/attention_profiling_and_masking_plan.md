@@ -67,7 +67,7 @@ For each attention layer at each sampled timestep:
 
 To keep memory and compute manageable:
 
-- **Timesteps:** Sample 5–8 representative timesteps across the denoising schedule (e.g., t ∈ {0.05, 0.15, 0.3, 0.5, 0.7, 0.85, 0.95}).
+- **Timesteps:** Sample 5–8 representative normalized timesteps (range [0, 1], where 0 = clean and 1 = full noise) across the denoising schedule (e.g., t ∈ {0.05, 0.15, 0.3, 0.5, 0.7, 0.85, 0.95}). These values are chosen to cover early denoising (high noise, t ≈ 0.95), mid denoising, and late denoising (low noise, t ≈ 0.05) roughly uniformly.
 - **Batching:** Profile with batch size 1.
 - **Resolution:** Use the model's standard inference resolution (e.g., 512×512 or 1024×1024). Note that image token count = H×W / patch_size².
 - **Heads:** Capture all 24 heads; aggregate statistics but also examine per-head variability.
@@ -228,7 +228,7 @@ Flux2Transformer2DModel
 | Metric | Description | Measurement |
 |---|---|---|
 | **Wall-clock time** (per image) | End-to-end generation latency | `time.perf_counter` or existing profiler |
-| **Attention FLOPs** | Theoretical FLOPs saved by masking | Compute from mask sparsity ratio |
+| **Attention FLOP reduction** | Theoretical FLOP savings from masking (fraction of attention FLOPs eliminated) | Compute from mask sparsity ratio: `FLOP_savings = 1 − (non-masked entries / total entries)` |
 | **Peak GPU memory** | Maximum GPU memory during generation | `torch.cuda.max_memory_allocated` |
 | **Attention kernel time** | Time spent in attention ops per block | `torch.profiler` with `record_function` labels |
 
@@ -298,7 +298,7 @@ Flux2Transformer2DModel
 
 ### 5.1 Memory Considerations
 
-Full attention weight tensors are large: for sequence length S = 4096 (e.g., 64×64 image tokens + text tokens), each layer's attention weights are `[1, 24, ~4096, ~4096]` = ~1.5 GB in float32 per block. Mitigation strategies:
+Full attention weight tensors are large: for sequence length S = 4096 (e.g., 64×64 image tokens + text tokens), each layer's attention weights are `[1, 24, 4096, 4096] = 1 × 24 × 4096 × 4096 × 4 bytes ≈ 1.61 GB` in float32 per block. Mitigation strategies:
 
 - Store attention weights in float16 or bfloat16.
 - Only capture one head at a time, or average across heads.
