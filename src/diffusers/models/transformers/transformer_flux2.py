@@ -258,118 +258,6 @@ class AttentionProfilingStore:
     def clear(self):
         self.entries.clear()
 
-    def _compute_metrics(
-        self,
-        attn_weights: torch.Tensor,
-        num_text_tokens: int,
-        block_type: str,
-        block_index: int,
-        timestep: float,
-    ) -> AttentionProfileEntry:
-        """Compute profiling metrics from attention weights.
-
-        All computation happens on CPU to avoid GPU OOM. The attn_weights tensor
-        is expected to already be on CPU in float32.
-
-        Args:
-            attn_weights: [B, H, S, S] attention weight tensor (after softmax, on CPU, float32).
-            num_text_tokens: Number of text tokens in the sequence.
-            block_type: "double" or "single".
-            block_index: Index of the block.
-            timestep: Current denoising timestep.
-        """
-        B, H, S, _ = attn_weights.shape
-        num_image_tokens = S - num_text_tokens
-        t = num_text_tokens
-
-        # Quadrant mean attention weights
-        mean_tt = attn_weights[:, :, :t, :t].mean().item() if t > 0 else 0.0
-        mean_ti = attn_weights[:, :, :t, t:].mean().item() if t > 0 and num_image_tokens > 0 else 0.0
-        mean_it = attn_weights[:, :, t:, :t].mean().item() if t > 0 and num_image_tokens > 0 else 0.0
-        mean_ii = attn_weights[:, :, t:, t:].mean().item() if num_image_tokens > 0 else 0.0
-
-        # Per-head entropy: -sum(p * log(p)) averaged across batch and query positions
-        # Already float32 on CPU so no upcast needed
-        log_weights = torch.log(attn_weights.clamp(min=1e-10))
-        entropy = -(attn_weights * log_weights).sum(dim=-1)  # [B, H, S]
-        per_head_entropy = entropy.mean(dim=(0, 2))  # [H]
-        del log_weights, entropy
-
-        # Per-head sparsity: fraction of weights below threshold
-        sparse_mask = attn_weights < self.sparsity_threshold
-        per_head_sparsity = sparse_mask.float().mean(dim=(0, 2, 3))  # [H]
-        del sparse_mask
-
-        # Top-k concentration: fraction of total attention in top-k keys per query
-        topk_vals, _ = attn_weights.topk(min(self.topk, S), dim=-1)  # [B, H, S, k]
-        topk_sum = topk_vals.sum(dim=-1)  # [B, H, S]
-        per_head_topk = topk_sum.mean(dim=(0, 2))  # [H]
-        del topk_vals, topk_sum
-
-        # Locality profile for I→I quadrant: average attention as a function of spatial distance.
-        ii_locality_profile = None
-        grid_h, grid_w = 0, 0
-        if num_image_tokens > 1:
-            grid_h = int(math.isqrt(num_image_tokens))
-            grid_w = num_image_tokens // grid_h if grid_h > 0 else 0
-            if grid_h * grid_w == num_image_tokens and grid_h > 0:
-                rows = torch.arange(grid_h)
-                cols = torch.arange(grid_w)
-                grid_rows = rows.repeat_interleave(grid_w)
-                grid_cols = cols.repeat(grid_h)
-
-                dist = (grid_rows.unsqueeze(1) - grid_rows.unsqueeze(0)).abs() + \
-                       (grid_cols.unsqueeze(1) - grid_cols.unsqueeze(0)).abs()
-                max_dist = int(dist.max().item())
-
-                ii_attn = attn_weights[:, :, t:, t:].mean(dim=(0, 1))  # [N_img, N_img]
-
-                profile = torch.zeros(max_dist + 1)
-                for d in range(max_dist + 1):
-                    mask = dist == d
-                    if mask.any():
-                        profile[d] = ii_attn[mask].mean()
-                ii_locality_profile = profile
-                del dist, ii_attn, profile
-
-        # Save full weights depending on mode:
-        #   True  -> keep in CPU memory (high RAM usage)
-        #   "disk" -> save to .pt file on disk (low RAM, needs disk I/O to read back)
-        #   False -> discard
-        full_attention_weights = None
-        full_attention_weights_path = None
-        if self.store_full_weights is True:
-            full_attention_weights = attn_weights.to(torch.float16)
-        elif self.store_full_weights == "disk" and self.weights_dir is not None:
-            weights_f16 = attn_weights.to(torch.float16)
-            entry_idx = len(self.entries)
-            path = os.path.join(self.weights_dir, f"attn_{block_type}_{block_index}_t{timestep:.4f}_{entry_idx}.pt")
-            torch.save(weights_f16, path)
-            full_attention_weights_path = path
-            del weights_f16
-        del attn_weights
-
-        entry = AttentionProfileEntry(
-            block_type=block_type,
-            block_index=block_index,
-            timestep=timestep,
-            num_text_tokens=num_text_tokens,
-            num_image_tokens=num_image_tokens,
-            mean_weight_tt=mean_tt,
-            mean_weight_ti=mean_ti,
-            mean_weight_it=mean_it,
-            mean_weight_ii=mean_ii,
-            per_head_entropy=per_head_entropy,
-            per_head_sparsity=per_head_sparsity,
-            per_head_topk_concentration=per_head_topk,
-            ii_locality_profile=ii_locality_profile,
-            image_grid_h=grid_h,
-            image_grid_w=grid_w,
-            full_attention_weights=full_attention_weights,
-            full_attention_weights_path=full_attention_weights_path,
-        )
-        return entry
-
     def record(
         self,
         query: torch.Tensor,
@@ -378,8 +266,13 @@ class AttentionProfilingStore:
     ):
         """Compute attention weights from Q, K and record profiling metrics.
 
-        All heavy computation (attention matrix, entropy, etc.) is performed on CPU
-        to avoid GPU OOM. Only the small Q and K tensors are copied from GPU.
+        Processes one attention head at a time on the GPU to keep peak memory minimal.
+        Each head's [B, S, S] slice (~6 MB) is computed on GPU, metrics are accumulated
+        as small CPU scalars, and the GPU tensor is freed before the next head.
+
+        Peak VRAM: ~25 MB (one [B, S, S] head + intermediates).
+        Peak CPU RAM: ~160 MB only when store_full_weights="disk" (transient fp16 buffer,
+        freed after the disk write). Otherwise negligible.
 
         Args:
             query: [B, S, H, D] query tensor (after RoPE, before dispatch).
@@ -390,24 +283,154 @@ class AttentionProfilingStore:
             return
 
         with torch.no_grad():
-            # Move Q, K to CPU to avoid GPU OOM from the large [B, H, S, S] attention matrix.
-            # Q, K are [B, S, H, D] (~few MB) while the attention matrix can be hundreds of MB.
-            query_cpu = query.detach().float().cpu()
-            key_cpu = key.detach().float().cpu()
+            B, S, H, D = query.shape
+            scale = 1.0 / math.sqrt(D)
+            t = num_text_tokens
+            num_image_tokens = S - t
 
-            scale = 1.0 / math.sqrt(query_cpu.shape[-1])
-            # Compute attention scores on CPU: [B, H, S_q, S_k]
-            attn_scores = torch.einsum("bshd,bthd->bhst", query_cpu, key_cpu) * scale
-            del query_cpu, key_cpu
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            del attn_scores
+            # Per-head metric accumulators (one scalar per head — tiny)
+            entropy_acc = torch.zeros(H)
+            sparsity_acc = torch.zeros(H)
+            topk_acc = torch.zeros(H)
 
-            entry = self._compute_metrics(
-                attn_weights=attn_weights,
-                num_text_tokens=num_text_tokens,
+            # Quadrant mean accumulators (summed over heads, divided at the end)
+            sum_tt = 0.0
+            sum_ti = 0.0
+            sum_it = 0.0
+            sum_ii = 0.0
+
+            # Locality: accumulate the I→I attention slice, averaged over B, summed over heads.
+            # Shape is [N_img, N_img] on CPU (~4 MB for 1024 image tokens), accumulated head-by-head.
+            ii_attn_sum: Optional[torch.Tensor] = None
+
+            # For full weight storage: pre-allocate a [B, H, S, S] fp16 CPU buffer.
+            # This is ~150 MB (transient — freed immediately after the disk write).
+            # Only allocated when actually needed; skip for store_full_weights=False.
+            need_full = self.store_full_weights is True or (
+                self.store_full_weights == "disk" and self.weights_dir is not None
+            )
+            full_weights_buf: Optional[torch.Tensor] = (
+                torch.empty(B, H, S, S, dtype=torch.float16, device="cpu") if need_full else None
+            )
+
+            # --- Process one head at a time on GPU ---
+            for h in range(H):
+                q_h = query[:, :, h, :]  # [B, S, D]
+                k_h = key[:, :, h, :]    # [B, S, D]
+
+                # [B, S, S] on GPU — ~6 MB for S=1280 in float32
+                scores_h = torch.einsum("bsd,btd->bst", q_h, k_h) * scale
+                attn_h = F.softmax(scores_h, dim=-1)  # [B, S, S]
+                del scores_h
+
+                # Quadrant means (averaged over B and query positions for this head)
+                if t > 0:
+                    sum_tt += attn_h[:, :t, :t].mean().item()
+                    if num_image_tokens > 0:
+                        sum_ti += attn_h[:, :t, t:].mean().item()
+                        sum_it += attn_h[:, t:, :t].mean().item()
+                if num_image_tokens > 0:
+                    sum_ii += attn_h[:, t:, t:].mean().item()
+
+                # Entropy: -sum(p * log(p)) averaged over B and query positions
+                log_h = torch.log(attn_h.clamp(min=1e-10))
+                entropy_acc[h] = (-(attn_h * log_h).sum(dim=-1).mean()).item()
+                del log_h
+
+                # Sparsity: fraction of weights below threshold
+                sparsity_acc[h] = (attn_h < self.sparsity_threshold).float().mean().item()
+
+                # Top-k concentration: fraction of total attention in top-k keys per query
+                k_clamped = min(self.topk, S)
+                topk_acc[h] = attn_h.topk(k_clamped, dim=-1)[0].sum(dim=-1).mean().item()
+
+                # Locality: accumulate I→I slice averaged over B
+                if num_image_tokens > 1:
+                    ii_h = attn_h[:, t:, t:].mean(dim=0).cpu()  # [N_img, N_img]
+                    if ii_attn_sum is None:
+                        ii_attn_sum = ii_h
+                    else:
+                        ii_attn_sum.add_(ii_h)
+                    del ii_h
+
+                # Full weight storage: copy this head's slice into the CPU buffer
+                if full_weights_buf is not None:
+                    full_weights_buf[:, h, :, :] = attn_h.to(torch.float16).cpu()
+
+                del attn_h
+            # --- End per-head loop ---
+
+            # Finalize quadrant means (average over H)
+            mean_tt = (sum_tt / H) if t > 0 else 0.0
+            mean_ti = (sum_ti / H) if t > 0 and num_image_tokens > 0 else 0.0
+            mean_it = (sum_it / H) if t > 0 and num_image_tokens > 0 else 0.0
+            mean_ii = (sum_ii / H) if num_image_tokens > 0 else 0.0
+
+            # Locality profile: bin mean I→I attention by Manhattan distance
+            ii_locality_profile = None
+            grid_h_val, grid_w_val = 0, 0
+            if ii_attn_sum is not None:
+                ii_attn_avg = ii_attn_sum / H  # [N_img, N_img], mean over H
+                del ii_attn_sum
+
+                grid_h_val = int(math.isqrt(num_image_tokens))
+                grid_w_val = num_image_tokens // grid_h_val if grid_h_val > 0 else 0
+                if grid_h_val * grid_w_val == num_image_tokens and grid_h_val > 0:
+                    rows = torch.arange(grid_h_val)
+                    cols = torch.arange(grid_w_val)
+                    grid_rows = rows.repeat_interleave(grid_w_val)
+                    grid_cols = cols.repeat(grid_h_val)
+                    dist = (grid_rows.unsqueeze(1) - grid_rows.unsqueeze(0)).abs() + \
+                           (grid_cols.unsqueeze(1) - grid_cols.unsqueeze(0)).abs()
+                    max_dist = int(dist.max().item())
+                    profile = torch.zeros(max_dist + 1)
+                    for d in range(max_dist + 1):
+                        mask = dist == d
+                        if mask.any():
+                            profile[d] = ii_attn_avg[mask].mean()
+                    ii_locality_profile = profile
+                    del dist, profile
+                del ii_attn_avg
+
+            # Save full weights depending on mode:
+            #   True  -> keep in CPU memory (high RAM usage if many entries)
+            #   "disk" -> save to .pt file on disk (transient ~150 MB buffer, freed after write)
+            #   False -> discard
+            full_attention_weights = None
+            full_attention_weights_path = None
+            if full_weights_buf is not None:
+                if self.store_full_weights is True:
+                    full_attention_weights = full_weights_buf
+                    full_weights_buf = None
+                elif self.store_full_weights == "disk" and self.weights_dir is not None:
+                    entry_idx = len(self.entries)
+                    path = os.path.join(
+                        self.weights_dir,
+                        f"attn_{self.current_block_type}_{self.current_block_index}"
+                        f"_t{self.current_timestep:.4f}_{entry_idx}.pt",
+                    )
+                    torch.save(full_weights_buf, path)
+                    full_attention_weights_path = path
+                del full_weights_buf
+
+            entry = AttentionProfileEntry(
                 block_type=self.current_block_type,
                 block_index=self.current_block_index,
                 timestep=self.current_timestep,
+                num_text_tokens=num_text_tokens,
+                num_image_tokens=num_image_tokens,
+                mean_weight_tt=mean_tt,
+                mean_weight_ti=mean_ti,
+                mean_weight_it=mean_it,
+                mean_weight_ii=mean_ii,
+                per_head_entropy=entropy_acc,
+                per_head_sparsity=sparsity_acc,
+                per_head_topk_concentration=topk_acc,
+                ii_locality_profile=ii_locality_profile,
+                image_grid_h=grid_h_val,
+                image_grid_w=grid_w_val,
+                full_attention_weights=full_attention_weights,
+                full_attention_weights_path=full_attention_weights_path,
             )
             self.entries.append(entry)
 
