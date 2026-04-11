@@ -14,6 +14,8 @@
 
 import inspect
 import math
+import os
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -212,6 +214,21 @@ class AttentionProfileEntry:
     image_grid_w: int = 0
     # Full attention weights (only stored if requested, can be very large)
     full_attention_weights: Optional[torch.Tensor] = None
+    # Path to disk-offloaded full attention weights (.pt file), used when store_full_weights="disk"
+    full_attention_weights_path: Optional[str] = None
+
+    def load_full_attention_weights(self) -> Optional[torch.Tensor]:
+        """Load full attention weights from memory or disk.
+
+        Returns the cached tensor if available (store_full_weights=True mode),
+        otherwise loads from disk if a path exists (store_full_weights="disk" mode).
+        Returns None if neither is available (store_full_weights=False mode).
+        """
+        if self.full_attention_weights is not None:
+            return self.full_attention_weights
+        if self.full_attention_weights_path is not None and os.path.isfile(self.full_attention_weights_path):
+            return torch.load(self.full_attention_weights_path, weights_only=True)
+        return None
 
 
 @dataclass
@@ -220,9 +237,11 @@ class AttentionProfilingStore:
 
     entries: List[AttentionProfileEntry] = field(default_factory=list)
     enabled: bool = False
-    store_full_weights: bool = False
+    store_full_weights: Union[bool, str] = False  # False, True, or "disk"
     sparsity_threshold: float = 0.01
     topk: int = 32
+    # Directory for disk-offloaded attention weights (created when store_full_weights="disk")
+    weights_dir: Optional[str] = None
     # Track the current timestep (set by the model's forward method)
     current_timestep: float = 0.0
     # Track the current block index (set by the model's forward method)
@@ -319,8 +338,21 @@ class AttentionProfilingStore:
                 ii_locality_profile = profile.detach().cpu()
                 del dist, ii_attn, profile, counts
 
-        # Save full weights to CPU before releasing GPU tensor
-        full_attention_weights = attn_weights.detach().cpu().to(torch.float16) if self.store_full_weights else None
+        # Save full weights depending on mode:
+        #   True  -> keep in CPU memory (high RAM usage)
+        #   "disk" -> save to .pt file on disk (low RAM, needs disk I/O to read back)
+        #   False -> discard
+        full_attention_weights = None
+        full_attention_weights_path = None
+        if self.store_full_weights is True:
+            full_attention_weights = attn_weights.detach().cpu().to(torch.float16)
+        elif self.store_full_weights == "disk":
+            weights_cpu = attn_weights.detach().cpu().to(torch.float16)
+            entry_idx = len(self.entries)
+            path = os.path.join(self.weights_dir, f"attn_{block_type}_{block_index}_t{timestep:.4f}_{entry_idx}.pt")
+            torch.save(weights_cpu, path)
+            full_attention_weights_path = path
+            del weights_cpu
         del attn_weights
 
         entry = AttentionProfileEntry(
@@ -340,6 +372,7 @@ class AttentionProfilingStore:
             image_grid_h=grid_h,
             image_grid_w=grid_w,
             full_attention_weights=full_attention_weights,
+            full_attention_weights_path=full_attention_weights_path,
         )
         return entry
 
@@ -1129,7 +1162,7 @@ class Flux2Transformer2DModel(
     def set_profiling_mode(
         self,
         enabled: bool,
-        store_full_weights: bool = False,
+        store_full_weights: Union[bool, str] = False,
         sparsity_threshold: float = 0.01,
         topk: int = 32,
     ):
@@ -1140,7 +1173,11 @@ class Flux2Transformer2DModel(
 
         Args:
             enabled: Whether to enable profiling.
-            store_full_weights: If True, store full [B, H, S, S] attention weights (very memory-intensive).
+            store_full_weights: Controls storage of full [B, H, S, S] attention weight matrices.
+                - False: Do not store (lowest memory usage, no heatmaps).
+                - True: Store in CPU memory (high RAM usage).
+                - "disk": Save to temporary .pt files on disk (low RAM, supports heatmaps).
+                  Use ``entry.load_full_attention_weights()`` to load a specific entry's weights.
             sparsity_threshold: Threshold below which an attention weight is considered "sparse".
             topk: Number of top keys to consider for top-k concentration metric.
         """
@@ -1150,6 +1187,13 @@ class Flux2Transformer2DModel(
         store.sparsity_threshold = sparsity_threshold
         store.topk = topk
         store.clear()
+
+        # Create temp directory for disk-offloaded weights
+        if store_full_weights == "disk":
+            store.weights_dir = tempfile.mkdtemp(prefix="attn_weights_")
+            logger.info(f"Attention weights will be saved to {store.weights_dir}")
+        else:
+            store.weights_dir = None
 
         if enabled:
             # Swap processors to profiling variants
