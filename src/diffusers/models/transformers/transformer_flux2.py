@@ -19,6 +19,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -224,12 +225,20 @@ class AttentionProfileEntry:
         otherwise loads from disk if a path exists (store_full_weights="disk" mode).
         Returns None if neither is available (store_full_weights=False mode),
         or if the file cannot be read.
+
+        Disk files may be in numpy (.npy) or torch (.pt) format.
         """
         if self.full_attention_weights is not None:
             return self.full_attention_weights
         if self.full_attention_weights_path is not None and os.path.isfile(self.full_attention_weights_path):
             try:
-                return torch.load(self.full_attention_weights_path, weights_only=True)
+                path = self.full_attention_weights_path
+                if path.endswith(".npy"):
+                    # Numpy memmap format written by record() — load and convert to tensor
+                    arr = np.load(path, mmap_mode="r")
+                    return torch.from_numpy(np.array(arr))
+                else:
+                    return torch.load(path, weights_only=True)
             except Exception as exc:
                 logger.warning(f"Failed to load attention weights from {self.full_attention_weights_path}: {exc}")
                 return None
@@ -270,9 +279,12 @@ class AttentionProfilingStore:
         Each head's [B, S, S] slice (~6 MB) is computed on GPU, metrics are accumulated
         as small CPU scalars, and the GPU tensor is freed before the next head.
 
+        For store_full_weights="disk", each head is written directly to a numpy memory-mapped
+        file on disk as it is computed. This avoids the 150 MB pre-allocated CPU buffer and
+        keeps peak CPU RAM at ~13 MB regardless of model size.
+
         Peak VRAM: ~25 MB (one [B, S, S] head + intermediates).
-        Peak CPU RAM: ~160 MB only when store_full_weights="disk" (transient fp16 buffer,
-        freed after the disk write). Otherwise negligible.
+        Peak CPU RAM: ~13 MB for disk mode; negligible for False mode; ~150 MB for True mode.
 
         Args:
             query: [B, S, H, D] query tensor (after RoPE, before dispatch).
@@ -303,15 +315,29 @@ class AttentionProfilingStore:
             # Shape is [N_img, N_img] on CPU (~4 MB for 1024 image tokens), accumulated head-by-head.
             ii_attn_sum: Optional[torch.Tensor] = None
 
-            # For full weight storage: pre-allocate a [B, H, S, S] fp16 CPU buffer.
-            # This is ~150 MB (transient — freed immediately after the disk write).
-            # Only allocated when actually needed; skip for store_full_weights=False.
-            need_full = self.store_full_weights is True or (
-                self.store_full_weights == "disk" and self.weights_dir is not None
-            )
-            full_weights_buf: Optional[torch.Tensor] = (
-                torch.empty(B, H, S, S, dtype=torch.float16, device="cpu") if need_full else None
-            )
+            # Full weight storage setup:
+            #   True  -> pre-allocate [B, H, S, S] fp16 CPU tensor (~150 MB), kept in the entry.
+            #   "disk" -> open a numpy memmap file; each head (~6 MB) is written directly to disk
+            #             via the OS page cache — peak Python RAM is ~13 MB regardless of H or S.
+            #   False -> skip entirely.
+            full_weights_buf: Optional[torch.Tensor] = None    # store_full_weights=True only
+            full_weights_mmap = None                           # store_full_weights="disk" only
+            full_attention_weights_path: Optional[str] = None
+            if self.store_full_weights is True:
+                full_weights_buf = torch.empty(B, H, S, S, dtype=torch.float16, device="cpu")
+            elif self.store_full_weights == "disk" and self.weights_dir is not None:
+                entry_idx = len(self.entries)
+                full_attention_weights_path = os.path.join(
+                    self.weights_dir,
+                    f"attn_{self.current_block_type}_{self.current_block_index}"
+                    f"_t{self.current_timestep:.4f}_{entry_idx}.npy",
+                )
+                # Open the numpy memmap *before* the head loop so we can stream into it.
+                # np.lib.format.open_memmap creates the .npy file with the correct header
+                # and maps it; writing through the view goes to disk via the OS, not Python RAM.
+                full_weights_mmap = np.lib.format.open_memmap(
+                    full_attention_weights_path, mode="w+", dtype=np.float16, shape=(B, H, S, S)
+                )
 
             # --- Process one head at a time on GPU ---
             for h in range(H):
@@ -353,9 +379,11 @@ class AttentionProfilingStore:
                         ii_attn_sum.add_(ii_h)
                     del ii_h
 
-                # Full weight storage: copy this head's slice into the CPU buffer
+                # Full weight storage: write this head's slice to the CPU buffer or directly to disk
                 if full_weights_buf is not None:
                     full_weights_buf[:, h, :, :] = attn_h.to(torch.float16).cpu()
+                elif full_weights_mmap is not None:
+                    full_weights_mmap[:, h, :, :] = attn_h.to(torch.float16).cpu().numpy()
 
                 del attn_h
             # --- End per-head loop ---
@@ -393,25 +421,12 @@ class AttentionProfilingStore:
                 del ii_attn_avg
 
             # Save full weights depending on mode:
-            #   True  -> keep in CPU memory (high RAM usage if many entries)
-            #   "disk" -> save to .pt file on disk (transient ~150 MB buffer, freed after write)
-            #   False -> discard
-            full_attention_weights = None
-            full_attention_weights_path = None
-            if full_weights_buf is not None:
-                if self.store_full_weights is True:
-                    full_attention_weights = full_weights_buf
-                    full_weights_buf = None
-                elif self.store_full_weights == "disk" and self.weights_dir is not None:
-                    entry_idx = len(self.entries)
-                    path = os.path.join(
-                        self.weights_dir,
-                        f"attn_{self.current_block_type}_{self.current_block_index}"
-                        f"_t{self.current_timestep:.4f}_{entry_idx}.pt",
-                    )
-                    torch.save(full_weights_buf, path)
-                    full_attention_weights_path = path
-                del full_weights_buf
+            #   True  -> keep the pre-allocated CPU tensor in the entry
+            #   "disk" -> flush and close the memmap (data already on disk); store only the path
+            #   False -> nothing to do
+            if full_weights_mmap is not None:
+                del full_weights_mmap  # flushes OS page cache to disk and releases the mapping
+            full_attention_weights = full_weights_buf  # tensor for True mode, None for disk/False
 
             entry = AttentionProfileEntry(
                 block_type=self.current_block_type,
@@ -1199,9 +1214,10 @@ class Flux2Transformer2DModel(
         Args:
             enabled: Whether to enable profiling.
             store_full_weights: Controls storage of full [B, H, S, S] attention weight matrices.
-                - False: Do not store (lowest memory usage, no heatmaps).
-                - True: Store in CPU memory (high RAM usage).
-                - "disk": Save to temporary .pt files on disk (low RAM, supports heatmaps).
+                - False: Do not store (lowest memory usage, no heatmaps). Default.
+                - True: Store in CPU memory (~150 MB per entry — use only when RAM is plentiful).
+                - "disk": Stream heads directly to numpy memmap files on disk (~13 MB peak CPU RAM
+                  per block, zero cumulative RAM growth). Recommended for Colab / limited RAM.
                   Use ``entry.load_full_attention_weights()`` to load a specific entry's weights.
             sparsity_threshold: Threshold below which an attention weight is considered "sparse".
             topk: Number of top keys to consider for top-k concentration metric.
