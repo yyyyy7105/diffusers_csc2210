@@ -15,6 +15,9 @@
 import inspect
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import os
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -112,6 +115,59 @@ class Flux2FeedForward(nn.Module):
         return x
 
 
+class AttnStore:
+    """Class-level singleton shared between all attention processors.
+
+    Set ``enabled = True`` before a forward pass to accumulate per-block
+    image self-attention maps; call ``reset()`` to clear between steps.
+    Set ``block_radius`` to an integer to restrict image-to-image attention
+    to a Chebyshev neighborhood of that radius (others → −inf additive mask).
+    """
+
+    enabled: bool = False
+    block_radius: Optional[int] = None
+    num_txt_tokens: int = 0
+    img_ids: Optional[torch.Tensor] = None  # (Seq_img, 3) – row/col coords
+    _maps: list = []
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._maps = []
+
+    @classmethod
+    def add(cls, attn_map: torch.Tensor) -> None:
+        """Append a (Seq_img, Seq_img) cpu tensor."""
+        cls._maps.append(attn_map)
+
+    @classmethod
+    def get_maps(cls) -> list:
+        return list(cls._maps)
+
+
+def _make_blocked_mask(
+    img_ids: torch.Tensor,
+    radius: int,
+    num_txt: int,
+    seq_total: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return an additive attention mask (Seq_total, Seq_total).
+
+    Image-to-image pairs whose Chebyshev distance exceeds *radius* are set
+    to ``-inf`` so they vanish after softmax.  All other entries are 0.
+    """
+    rows = img_ids[:, 1].float()  # (Seq_img,)
+    cols = img_ids[:, 2].float()
+    dr = (rows.unsqueeze(0) - rows.unsqueeze(1)).abs()  # (Seq_img, Seq_img)
+    dc = (cols.unsqueeze(0) - cols.unsqueeze(1)).abs()
+    blocked = (dr > radius) | (dc > radius)
+
+    mask = torch.zeros(seq_total, seq_total, device=device, dtype=dtype)
+    mask[num_txt:, num_txt:].masked_fill_(blocked, float("-inf"))
+    return mask
+
+
 class Flux2AttnProcessor:
     _attention_backend = None
     _parallel_config = None
@@ -154,6 +210,26 @@ class Flux2AttnProcessor:
         if image_rotary_emb is not None:
             query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
             key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        num_txt = AttnStore.num_txt_tokens
+
+        # --- Image self-attention heatmap capture ---
+        if AttnStore.enabled and query.shape[1] > num_txt:
+            with torch.no_grad():
+                q_img = query[:, num_txt:].transpose(1, 2)  # (B, H, Seq_img, D)
+                k_img = key[:, num_txt:].transpose(1, 2)
+                scores = torch.matmul(q_img, k_img.transpose(-1, -2)) / math.sqrt(q_img.size(-1))
+                probs = torch.softmax(scores, dim=-1).mean(dim=(0, 1))  # (Seq_img, Seq_img)
+                AttnStore.add(probs.cpu())
+                del q_img, k_img, scores, probs
+
+        # --- Blocked (spatially local) attention mask ---
+        if AttnStore.block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
+            blocked_mask = _make_blocked_mask(
+                AttnStore.img_ids, AttnStore.block_radius,
+                num_txt, query.shape[1], query.device, query.dtype,
+            )
+            attention_mask = blocked_mask if attention_mask is None else attention_mask + blocked_mask
 
         hidden_states = dispatch_attention_fn(
             query,
@@ -290,6 +366,26 @@ class Flux2ParallelSelfAttnProcessor:
         if image_rotary_emb is not None:
             query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
             key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        num_txt = AttnStore.num_txt_tokens
+
+        # --- Image self-attention heatmap capture ---
+        if AttnStore.enabled and query.shape[1] > num_txt:
+            with torch.no_grad():
+                q_img = query[:, num_txt:].transpose(1, 2)  # (B, H, Seq_img, D)
+                k_img = key[:, num_txt:].transpose(1, 2)
+                scores = torch.matmul(q_img, k_img.transpose(-1, -2)) / math.sqrt(q_img.size(-1))
+                probs = torch.softmax(scores, dim=-1).mean(dim=(0, 1))  # (Seq_img, Seq_img)
+                AttnStore.add(probs.cpu())
+                del q_img, k_img, scores, probs
+
+        # --- Blocked (spatially local) attention mask ---
+        if AttnStore.block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
+            blocked_mask = _make_blocked_mask(
+                AttnStore.img_ids, AttnStore.block_radius,
+                num_txt, query.shape[1], query.device, query.dtype,
+            )
+            attention_mask = blocked_mask if attention_mask is None else attention_mask + blocked_mask
 
         hidden_states = dispatch_attention_fn(
             query,
@@ -826,6 +922,7 @@ class Flux2Transformer2DModel(
                 )
 
         num_txt_tokens = encoder_hidden_states.shape[1]
+        AttnStore.num_txt_tokens = num_txt_tokens
 
         # 1. Calculate timestep embedding and modulation parameters
         timestep = timestep.to(hidden_states.dtype) * 1000
@@ -850,6 +947,7 @@ class Flux2Transformer2DModel(
             img_ids = img_ids[0]
         if txt_ids.ndim == 3:
             txt_ids = txt_ids[0]
+        AttnStore.img_ids = img_ids
 
         image_rotary_emb = self.pos_embed(img_ids)
         text_rotary_emb = self.pos_embed(txt_ids)

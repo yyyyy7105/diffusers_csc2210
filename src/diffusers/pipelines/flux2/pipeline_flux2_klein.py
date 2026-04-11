@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from contextlib import nullcontext
 import gc
@@ -26,6 +27,7 @@ from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
 from ...loaders import Flux2LoraLoaderMixin
 from ...models import AutoencoderKLFlux2, Flux2Transformer2DModel
+from ...models.transformers.transformer_flux2 import AttnStore
 from ...schedulers import FlowMatchEulerDiscreteScheduler
 from ...utils import is_torch_xla_available, logging, replace_example_docstring
 from ...utils.torch_utils import randn_tensor
@@ -653,11 +655,11 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         recorded_events = []
         for item in key_avgs:
             if item.key in self.profile_event_names:
-                # print(item)
-                recorded_events.append(item)
+                print(item)
+        #         recorded_events.append(item)
                 
-        print("Recorded Events")
-        print(EventList(recorded_events).table())
+        # print("Recorded Events")
+        # print(EventList(recorded_events).table())
         print(key_avgs.table(sort_by="cpu_time_total", row_limit=100))
         print(key_avgs.table(sort_by="cuda_time_total", row_limit=100))
                 
@@ -696,6 +698,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
         text_encoder_out_layers: Tuple[int] = (9, 18, 27),
+        save_attn_heatmaps: bool = False,
+        attn_heatmap_dir: str = "./attn_heatmaps",
+        attn_block_radius: Optional[int] = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -901,7 +906,12 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                 self._num_timesteps = len(timesteps)
 
             self.clear_gpu_cache()
-            
+
+            # Configure AttnStore for this generation run
+            AttnStore.block_radius = attn_block_radius
+            if save_attn_heatmaps:
+                os.makedirs(attn_heatmap_dir, exist_ok=True)
+
             # 7. Denoising loop
             self.scheduler.set_begin_index(0)
             with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -922,6 +932,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                                 latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
                                 latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
+                            AttnStore.reset()
+                            AttnStore.enabled = save_attn_heatmaps
+
                             with self.transformer.cache_context("cond"):
                                 noise_pred = self.transformer(
                                     hidden_states=latent_model_input,
@@ -933,6 +946,13 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                                     joint_attention_kwargs=self.attention_kwargs,
                                     return_dict=False,
                                 )[0]
+
+                            AttnStore.enabled = False  # don't capture unconditional pass
+                            if save_attn_heatmaps:
+                                maps = AttnStore.get_maps()
+                                if maps:
+                                    stacked = torch.stack(maps, dim=0)  # (num_blocks, Seq_img, Seq_img)
+                                    torch.save(stacked, os.path.join(attn_heatmap_dir, f"step_{i:03d}.pt"))
 
                             noise_pred = noise_pred[:, : latents.size(1) :]
 
