@@ -222,12 +222,17 @@ class AttentionProfileEntry:
 
         Returns the cached tensor if available (store_full_weights=True mode),
         otherwise loads from disk if a path exists (store_full_weights="disk" mode).
-        Returns None if neither is available (store_full_weights=False mode).
+        Returns None if neither is available (store_full_weights=False mode),
+        or if the file cannot be read.
         """
         if self.full_attention_weights is not None:
             return self.full_attention_weights
         if self.full_attention_weights_path is not None and os.path.isfile(self.full_attention_weights_path):
-            return torch.load(self.full_attention_weights_path, weights_only=True)
+            try:
+                return torch.load(self.full_attention_weights_path, weights_only=True)
+            except Exception as exc:
+                logger.warning(f"Failed to load attention weights from {self.full_attention_weights_path}: {exc}")
+                return None
         return None
 
 
@@ -346,7 +351,7 @@ class AttentionProfilingStore:
         full_attention_weights_path = None
         if self.store_full_weights is True:
             full_attention_weights = attn_weights.detach().cpu().to(torch.float16)
-        elif self.store_full_weights == "disk":
+        elif self.store_full_weights == "disk" and self.weights_dir is not None:
             weights_cpu = attn_weights.detach().cpu().to(torch.float16)
             entry_idx = len(self.entries)
             path = os.path.join(self.weights_dir, f"attn_{block_type}_{block_index}_t{timestep:.4f}_{entry_idx}.pt")
