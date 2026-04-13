@@ -27,7 +27,7 @@ from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
 from ...loaders import Flux2LoraLoaderMixin
 from ...models import AutoencoderKLFlux2, Flux2Transformer2DModel
-from ...models.transformers.transformer_flux2 import AttnStore
+from ...models.transformers.transformer_flux2 import AttnStore, BlockRadiusSchedule
 from ...schedulers import FlowMatchEulerDiscreteScheduler
 from ...utils import is_torch_xla_available, logging, replace_example_docstring
 from ...utils.torch_utils import randn_tensor
@@ -700,7 +700,7 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
         text_encoder_out_layers: Tuple[int] = (9, 18, 27),
         save_attn_heatmaps: bool = False,
         attn_heatmap_dir: str = "./attn_heatmaps",
-        attn_block_radius: Optional[int] = None,
+        attn_block_radius: Union[int, BlockRadiusSchedule, None] = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -908,7 +908,9 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
             self.clear_gpu_cache()
 
             # Configure AttnStore for this generation run
-            AttnStore.block_radius = attn_block_radius
+            _radius_is_schedule = callable(attn_block_radius)
+            if not _radius_is_schedule:
+                AttnStore.set_block_radius(attn_block_radius)
             if save_attn_heatmaps:
                 os.makedirs(attn_heatmap_dir, exist_ok=True)
 
@@ -932,6 +934,8 @@ class Flux2KleinPipeline(DiffusionPipeline, Flux2LoraLoaderMixin):
                                 latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
                                 latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
+                            if _radius_is_schedule:
+                                AttnStore.set_block_radius(attn_block_radius(i, num_inference_steps))
                             AttnStore.reset()
                             AttnStore.enabled = save_attn_heatmaps
 

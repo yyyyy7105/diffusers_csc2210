@@ -182,6 +182,7 @@ wandb
 
 # images
 *.png
+*.gif
 
 # model files
 *.pt

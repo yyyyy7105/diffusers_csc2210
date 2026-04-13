@@ -1,7 +1,6 @@
 import torch
 import numpy as np
 import matplotlib
-# 关键修复：强制使用非交互式后端，避免 TclError (Tkinter) 报错
 matplotlib.use('Agg') 
 
 import matplotlib.pyplot as plt

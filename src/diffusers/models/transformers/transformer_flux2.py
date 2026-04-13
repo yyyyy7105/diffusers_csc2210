@@ -115,20 +115,72 @@ class Flux2FeedForward(nn.Module):
         return x
 
 
+class BlockRadiusSchedule:
+    """Base class for dynamic block radius schedules.
+
+    Subclass and implement ``__call__(step, total_steps) -> Optional[int]``.
+    Return ``None`` to disable blocking for that step.
+    """
+
+    def __call__(self, step: int, total_steps: int) -> Optional[int]:
+        raise NotImplementedError
+
+
+class LinearBlockRadius(BlockRadiusSchedule):
+    """Linearly interpolate radius from ``start`` to ``end`` over all steps."""
+
+    def __init__(self, start: int, end: int):
+        self.start = start
+        self.end = end
+
+    def __call__(self, step: int, total_steps: int) -> int:
+        t = step / max(total_steps - 1, 1)
+        return round(self.start + t * (self.end - self.start))
+
+    def __str__(self) -> str:
+        return f"LinearBlockRadius(start={self.start}, end={self.end})"
+
+
+class StepBlockRadius(BlockRadiusSchedule):
+    """No blocking for early steps; fixed radius once ``start_step`` is reached."""
+
+    def __init__(self, start_step: int, radius: int):
+        self.start_step = start_step
+        self.radius = radius
+
+    def __call__(self, step: int, total_steps: int) -> Optional[int]:
+        return self.radius if step >= self.start_step else None
+
+    def __str__(self) -> str:
+        return f"StepBlockRadius(start_step={self.start_step}, radius={self.radius})"
+
+
 class AttnStore:
     """Class-level singleton shared between all attention processors.
 
     Set ``enabled = True`` before a forward pass to accumulate per-block
     image self-attention maps; call ``reset()`` to clear between steps.
-    Set ``block_radius`` to an integer to restrict image-to-image attention
-    to a Chebyshev neighborhood of that radius (others → −inf additive mask).
+    Call ``set_block_radius(int | None)`` to restrict image attention to a
+    local Chebyshev window; the pipeline resolves any BlockRadiusSchedule
+    to a plain int before calling this method.
+    Read the current radius via ``block_radius`` (always int or None).
     """
 
     enabled: bool = False
-    block_radius: Optional[int] = None
+    _block_radius: Optional[int] = None  # always a resolved int; use set_block_radius() to write
     num_txt_tokens: int = 0
-    img_ids: Optional[torch.Tensor] = None  # (Seq_img, 3) – row/col coords
+    img_ids: Optional[torch.Tensor] = None  # (Seq_img, 4) – [t, row, col, layer]
     _maps: list = []
+    _cached_mask: Optional[torch.Tensor] = None   # cached blocked mask, reused across blocks
+    _cache_key: tuple = ()                         # (radius, num_txt, seq_total, device, dtype)
+
+    @classmethod
+    def set_block_radius(cls, radius: Optional[int]) -> None:
+        """Set the resolved block radius and invalidate the mask cache if changed."""
+        if cls._block_radius != radius:
+            cls._block_radius = radius
+            cls._cached_mask = None
+            cls._cache_key = ()
 
     @classmethod
     def reset(cls) -> None:
@@ -156,15 +208,24 @@ def _make_blocked_mask(
 
     Image-to-image pairs whose Chebyshev distance exceeds *radius* are set
     to ``-inf`` so they vanish after softmax.  All other entries are 0.
+    The result is cached in AttnStore and reused across all block calls
+    within the same forward pass (img_ids/radius/shape are constant).
     """
+    cache_key = (radius, num_txt, seq_total, device, dtype)
+    if AttnStore._cached_mask is not None and AttnStore._cache_key == cache_key:
+        return AttnStore._cached_mask
+
     rows = img_ids[:, 1].float()  # (Seq_img,)
     cols = img_ids[:, 2].float()
     dr = (rows.unsqueeze(0) - rows.unsqueeze(1)).abs()  # (Seq_img, Seq_img)
     dc = (cols.unsqueeze(0) - cols.unsqueeze(1)).abs()
     blocked = (dr > radius) | (dc > radius)
-
+    # breakpoint()
     mask = torch.zeros(seq_total, seq_total, device=device, dtype=dtype)
     mask[num_txt:, num_txt:].masked_fill_(blocked, float("-inf"))
+
+    AttnStore._cached_mask = mask
+    AttnStore._cache_key = cache_key
     return mask
 
 
@@ -213,24 +274,26 @@ class Flux2AttnProcessor:
 
         num_txt = AttnStore.num_txt_tokens
 
-        # --- Image self-attention heatmap capture ---
+        # --- Blocked (spatially local) attention mask ---
+        if AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
+            blocked_mask = _make_blocked_mask(
+                AttnStore.img_ids, AttnStore._block_radius,
+                num_txt, query.shape[1], query.device, query.dtype,
+            )
+            attention_mask = blocked_mask if attention_mask is None else attention_mask + blocked_mask
+
+        # --- Image self-attention heatmap capture (after mask, reflects blocking) ---
         if AttnStore.enabled and query.shape[1] > num_txt:
             with torch.no_grad():
                 q_img = query[:, num_txt:].transpose(1, 2)  # (B, H, Seq_img, D)
                 k_img = key[:, num_txt:].transpose(1, 2)
                 scores = torch.matmul(q_img, k_img.transpose(-1, -2)) / math.sqrt(q_img.size(-1))
+                if attention_mask is not None:
+                    scores = scores + attention_mask[num_txt:, num_txt:].unsqueeze(0).unsqueeze(0)
                 probs = torch.softmax(scores, dim=-1).mean(dim=(0, 1))  # (Seq_img, Seq_img)
                 AttnStore.add(probs.cpu())
                 del q_img, k_img, scores, probs
-
-        # --- Blocked (spatially local) attention mask ---
-        if AttnStore.block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
-            blocked_mask = _make_blocked_mask(
-                AttnStore.img_ids, AttnStore.block_radius,
-                num_txt, query.shape[1], query.device, query.dtype,
-            )
-            attention_mask = blocked_mask if attention_mask is None else attention_mask + blocked_mask
-
+        
         hidden_states = dispatch_attention_fn(
             query,
             key,
@@ -369,23 +432,25 @@ class Flux2ParallelSelfAttnProcessor:
 
         num_txt = AttnStore.num_txt_tokens
 
-        # --- Image self-attention heatmap capture ---
+        # --- Blocked (spatially local) attention mask ---
+        if AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
+            blocked_mask = _make_blocked_mask(
+                AttnStore.img_ids, AttnStore._block_radius,
+                num_txt, query.shape[1], query.device, query.dtype,
+            )
+            attention_mask = blocked_mask if attention_mask is None else attention_mask + blocked_mask
+
+        # --- Image self-attention heatmap capture (after mask, reflects blocking) ---
         if AttnStore.enabled and query.shape[1] > num_txt:
             with torch.no_grad():
                 q_img = query[:, num_txt:].transpose(1, 2)  # (B, H, Seq_img, D)
                 k_img = key[:, num_txt:].transpose(1, 2)
                 scores = torch.matmul(q_img, k_img.transpose(-1, -2)) / math.sqrt(q_img.size(-1))
+                if attention_mask is not None:
+                    scores = scores + attention_mask[num_txt:, num_txt:].unsqueeze(0).unsqueeze(0)
                 probs = torch.softmax(scores, dim=-1).mean(dim=(0, 1))  # (Seq_img, Seq_img)
                 AttnStore.add(probs.cpu())
                 del q_img, k_img, scores, probs
-
-        # --- Blocked (spatially local) attention mask ---
-        if AttnStore.block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
-            blocked_mask = _make_blocked_mask(
-                AttnStore.img_ids, AttnStore.block_radius,
-                num_txt, query.shape[1], query.device, query.dtype,
-            )
-            attention_mask = blocked_mask if attention_mask is None else attention_mask + blocked_mask
 
         hidden_states = dispatch_attention_fn(
             query,
