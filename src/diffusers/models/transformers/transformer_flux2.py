@@ -21,6 +21,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attn import flash_attn_func
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FluxTransformer2DLoadersMixin, FromOriginalModelMixin, PeftAdapterMixin
@@ -167,28 +168,23 @@ class AttnStore:
     """
 
     enabled: bool = False
-    use_flex_dispatch: bool = False  # set True only when running under torch.compile
     _block_radius: Optional[int] = None  # always a resolved int; use set_block_radius() to write
     num_txt_tokens: int = 0
     img_ids: Optional[torch.Tensor] = None  # (Seq_img, 4) – [t, row, col, layer]
     _maps: list = []
     _cached_mask: Optional[torch.Tensor] = None   # cached float mask, reused across blocks
     _cache_key: tuple = ()                         # (radius, num_txt, seq_total, device, dtype)
-    _cached_block_mask: Optional[Any] = None       # cached flex_attention.BlockMask for dispatch
-    _cached_block_mask_key: Optional[tuple] = None # (radius, num_txt, seq_total, W)
-    _mask_radius:  int = 0
-    _mask_num_txt: int = 0
-    _mask_W:       int = 0
+    _cached_z_sort:   Optional[torch.Tensor] = None  # Z-order sort indices (CPU)
+    _cached_z_unsort: Optional[torch.Tensor] = None  # Z-order unsort indices (CPU)
+    _cached_z_key:    Optional[int] = None            # = img_ids.shape[0]
 
     @classmethod
     def set_block_radius(cls, radius: Optional[int]) -> None:
-        """Set the resolved block radius and invalidate both mask caches if changed."""
+        """Set the resolved block radius and invalidate float mask cache if changed."""
         if cls._block_radius != radius:
             cls._block_radius = radius
             cls._cached_mask = None
             cls._cache_key = ()
-            cls._cached_block_mask = None
-            cls._cached_block_mask_key = ()
 
     @classmethod
     def reset(cls) -> None:
@@ -236,84 +232,28 @@ def _make_blocked_mask(
     AttnStore._cache_key = cache_key
     return mask
 
-def _chebyshev_mask_mod(_b, _h, q_idx, kv_idx):
-    """Module-level function so dynamo can cache the compiled graph across calls."""
-    num_txt = AttnStore._mask_num_txt
-    W       = AttnStore._mask_W
-    radius  = AttnStore._mask_radius
+def _morton_sort_indices(img_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Z-order (Morton code) sort and unsort indices for image tokens.
 
-    q_is_img  = q_idx  >= num_txt
-    kv_is_img = kv_idx >= num_txt
-    q_img  = q_idx  - num_txt
-    kv_img = kv_idx - num_txt
-    q_row,  q_col  = q_img  // W, q_img  % W
-    kv_row, kv_col = kv_img // W, kv_img % W
-    in_window = (torch.abs(q_row - kv_row) <= radius) & \
-                (torch.abs(q_col - kv_col) <= radius)
-    return ~(q_is_img & kv_is_img) | in_window
+    Returns (sort_idx, unsort_idx) on CPU:
+    - sort_idx[i]   = original token index occupying Z-order position i
+    - unsort_idx[i] = Z-order position of original token i
+    Derived from img_ids[:, 1] (row) and img_ids[:, 2] (col).
+    """
+    rows = img_ids[:, 1].long()
+    cols = img_ids[:, 2].long()
 
-def _make_block_mask(
-    radius: int,
-    num_txt: int,
-    seq_total: int,
-    W: int,
-    device: torch.device,
-) -> Any:
-    import torch.nn.attention.flex_attention as flex_attention
+    def spread_bits(x: torch.Tensor) -> torch.Tensor:
+        x = (x | (x << 8)) & 0x00FF00FF
+        x = (x | (x << 4)) & 0x0F0F0F0F
+        x = (x | (x << 2)) & 0x33333333
+        x = (x | (x << 1)) & 0x55555555
+        return x
 
-    cache_key = (radius, num_txt, seq_total, W)
-    if AttnStore._cached_block_mask is not None and AttnStore._cached_block_mask_key == cache_key:
-        return AttnStore._cached_block_mask
-
-    # 把参数写入 AttnStore，让顶层函数能读到
-    AttnStore._mask_radius  = radius
-    AttnStore._mask_num_txt = num_txt
-    AttnStore._mask_W       = W
-
-    block_mask = flex_attention.create_block_mask(
-        _chebyshev_mask_mod,  # 固定的顶层函数，dynamo 可以 cache
-        B=None, H=None, Q_LEN=seq_total, KV_LEN=seq_total, device=device
-    )
-    AttnStore._cached_block_mask     = block_mask
-    AttnStore._cached_block_mask_key = cache_key
-    return block_mask
-
-# def _make_block_mask(
-#     radius: int,
-#     num_txt: int,
-#     seq_total: int,
-#     W: int,
-#     device: torch.device,
-# ) -> Any:
-#     """Return a flex_attention.BlockMask encoding Chebyshev-local image attention (for dispatch efficiency).
-
-#     Text tokens attend to everything; image token i attends to image token j iff
-#     max(|row_i - row_j|, |col_i - col_j|) <= radius.
-#     Cached in AttnStore._cached_block_mask; separate from the float mask used for heatmap.
-#     """
-#     import torch.nn.attention.flex_attention as flex_attention
-
-#     cache_key = (radius, num_txt, seq_total, W)
-#     if AttnStore._cached_block_mask is not None and AttnStore._cached_block_mask_key == cache_key:
-#         return AttnStore._cached_block_mask
-
-#     def mask_mod(_b, _h, q_idx, kv_idx):
-#         q_is_img  = q_idx  >= num_txt
-#         kv_is_img = kv_idx >= num_txt
-#         q_img  = q_idx  - num_txt
-#         kv_img = kv_idx - num_txt
-#         q_row,  q_col  = q_img  // W, q_img  % W
-#         kv_row, kv_col = kv_img // W, kv_img % W
-#         in_window = (torch.abs(q_row - kv_row) <= radius) & \
-#                     (torch.abs(q_col - kv_col) <= radius)
-#         return ~(q_is_img & kv_is_img) | in_window
-
-#     block_mask = flex_attention.create_block_mask(
-#         mask_mod, B=None, H=None, Q_LEN=seq_total, KV_LEN=seq_total, device=device
-#     )
-#     AttnStore._cached_block_mask = block_mask
-#     AttnStore._cached_block_mask_key = cache_key
-#     return block_mask
+    codes = spread_bits(rows) | (spread_bits(cols) << 1)
+    sort_idx   = torch.argsort(codes)
+    unsort_idx = torch.argsort(sort_idx)
+    return sort_idx, unsort_idx
 
 
 class Flux2AttnProcessor:
@@ -378,15 +318,45 @@ class Flux2AttnProcessor:
                 AttnStore.add(probs.cpu())
                 del q_img, k_img, scores, probs
 
-        if AttnStore.use_flex_dispatch and AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
-            W_GRID = int(math.isqrt(query.shape[1] - num_txt))
-            block_mask = _make_block_mask(AttnStore._block_radius, num_txt, query.shape[1], W_GRID, query.device)
-            hidden_states = dispatch_attention_fn(
-                query, key, value,
-                attn_mask=block_mask,
-                backend=AttentionBackendName.FLEX,
-                parallel_config=self._parallel_config,
+        if AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt and num_txt > 0:
+            z_key = AttnStore.img_ids.shape[0]
+            if AttnStore._cached_z_sort is None or AttnStore._cached_z_key != z_key:
+                sort_idx, unsort_idx = _morton_sort_indices(AttnStore.img_ids)
+                AttnStore._cached_z_sort   = sort_idx
+                AttnStore._cached_z_unsort = unsort_idx
+                AttnStore._cached_z_key    = z_key
+            sort_idx   = AttnStore._cached_z_sort.to(query.device)
+            unsort_idx = AttnStore._cached_z_unsort.to(query.device)
+
+            q_txt = query[:, :num_txt];  q_img = query[:, num_txt:]
+            k_txt = key[:,   :num_txt];  k_img = key[:,   num_txt:]
+            v_txt = value[:, :num_txt];  v_img = value[:, num_txt:]
+
+            q_img_z = q_img[:, sort_idx]
+            k_img_z = k_img[:, sort_idx]
+            v_img_z = v_img[:, sort_idx]
+
+            # Pass 1: image × text (full cross-attention, LSE needed for combination)
+            out_img_txt, lse_txt, _ = flash_attn_func(q_img, k_txt, v_txt, return_attn_probs=True)
+
+            # Pass 2: image × image Z-order windowed attention (LSE needed for combination)
+            window = (2 * AttnStore._block_radius + 1) ** 2
+            out_img_z, lse_img_z, _ = flash_attn_func(
+                q_img_z, k_img_z, v_img_z, window_size=(window, window), return_attn_probs=True,
             )
+            out_img_img = out_img_z[:, unsort_idx]       # (B, num_img, H, D) in original order
+            lse_img     = lse_img_z[:, :, unsort_idx]    # (B, H, num_img) in original order
+
+            # Exact combination: log-sum-exp merge of text and image key contributions
+            lse_combined = torch.logaddexp(lse_txt, lse_img)
+            w_txt = torch.exp(lse_txt - lse_combined).permute(0, 2, 1).unsqueeze(-1)
+            w_img = torch.exp(lse_img - lse_combined).permute(0, 2, 1).unsqueeze(-1)
+            out_img = w_txt * out_img_txt + w_img * out_img_img  # (B, num_img, H, D)
+
+            # Pass 3: text × all (full attention, no combination needed)
+            out_txt = flash_attn_func(q_txt, key, value)
+
+            hidden_states = torch.cat([out_txt, out_img], dim=1)  # (B, seq_total, H, D)
         else:
             hidden_states = dispatch_attention_fn(
                 query, key, value,
@@ -541,15 +511,45 @@ class Flux2ParallelSelfAttnProcessor:
                 AttnStore.add(probs.cpu())
                 del q_img, k_img, scores, probs
 
-        if AttnStore.use_flex_dispatch and AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
-            W_GRID = int(math.isqrt(query.shape[1] - num_txt))
-            block_mask = _make_block_mask(AttnStore._block_radius, num_txt, query.shape[1], W_GRID, query.device)
-            hidden_states = dispatch_attention_fn(
-                query, key, value,
-                attn_mask=block_mask,
-                backend=AttentionBackendName.FLEX,
-                parallel_config=self._parallel_config,
+        if AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt and num_txt > 0:
+            z_key = AttnStore.img_ids.shape[0]
+            if AttnStore._cached_z_sort is None or AttnStore._cached_z_key != z_key:
+                sort_idx, unsort_idx = _morton_sort_indices(AttnStore.img_ids)
+                AttnStore._cached_z_sort   = sort_idx
+                AttnStore._cached_z_unsort = unsort_idx
+                AttnStore._cached_z_key    = z_key
+            sort_idx   = AttnStore._cached_z_sort.to(query.device)
+            unsort_idx = AttnStore._cached_z_unsort.to(query.device)
+
+            q_txt = query[:, :num_txt];  q_img = query[:, num_txt:]
+            k_txt = key[:,   :num_txt];  k_img = key[:,   num_txt:]
+            v_txt = value[:, :num_txt];  v_img = value[:, num_txt:]
+
+            q_img_z = q_img[:, sort_idx]
+            k_img_z = k_img[:, sort_idx]
+            v_img_z = v_img[:, sort_idx]
+
+            # Pass 1: image × text (full cross-attention, LSE needed for combination)
+            out_img_txt, lse_txt, _ = flash_attn_func(q_img, k_txt, v_txt, return_attn_probs=True)
+
+            # Pass 2: image × image Z-order windowed attention (LSE needed for combination)
+            window = (2 * AttnStore._block_radius + 1) ** 2
+            out_img_z, lse_img_z, _ = flash_attn_func(
+                q_img_z, k_img_z, v_img_z, window_size=(window, window), return_attn_probs=True,
             )
+            out_img_img = out_img_z[:, unsort_idx]       # (B, num_img, H, D) in original order
+            lse_img     = lse_img_z[:, :, unsort_idx]    # (B, H, num_img) in original order
+
+            # Exact combination: log-sum-exp merge of text and image key contributions
+            lse_combined = torch.logaddexp(lse_txt, lse_img)
+            w_txt = torch.exp(lse_txt - lse_combined).permute(0, 2, 1).unsqueeze(-1)
+            w_img = torch.exp(lse_img - lse_combined).permute(0, 2, 1).unsqueeze(-1)
+            out_img = w_txt * out_img_txt + w_img * out_img_img  # (B, num_img, H, D)
+
+            # Pass 3: text × all (full attention, no combination needed)
+            out_txt = flash_attn_func(q_txt, key, value)
+
+            hidden_states = torch.cat([out_txt, out_img], dim=1)  # (B, seq_total, H, D)
         else:
             hidden_states = dispatch_attention_fn(
                 query, key, value,
