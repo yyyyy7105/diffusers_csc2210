@@ -167,6 +167,7 @@ class AttnStore:
     """
 
     enabled: bool = False
+    use_flex_dispatch: bool = False  # set True only when running under torch.compile
     _block_radius: Optional[int] = None  # always a resolved int; use set_block_radius() to write
     num_txt_tokens: int = 0
     img_ids: Optional[torch.Tensor] = None  # (Seq_img, 4) – [t, row, col, layer]
@@ -174,7 +175,10 @@ class AttnStore:
     _cached_mask: Optional[torch.Tensor] = None   # cached float mask, reused across blocks
     _cache_key: tuple = ()                         # (radius, num_txt, seq_total, device, dtype)
     _cached_block_mask: Optional[Any] = None       # cached flex_attention.BlockMask for dispatch
-    _cached_block_mask_key: tuple = ()             # (radius, num_txt, seq_total, W)
+    _cached_block_mask_key: Optional[tuple] = None # (radius, num_txt, seq_total, W)
+    _mask_radius:  int = 0
+    _mask_num_txt: int = 0
+    _mask_W:       int = 0
 
     @classmethod
     def set_block_radius(cls, radius: Optional[int]) -> None:
@@ -232,6 +236,21 @@ def _make_blocked_mask(
     AttnStore._cache_key = cache_key
     return mask
 
+def _chebyshev_mask_mod(_b, _h, q_idx, kv_idx):
+    """Module-level function so dynamo can cache the compiled graph across calls."""
+    num_txt = AttnStore._mask_num_txt
+    W       = AttnStore._mask_W
+    radius  = AttnStore._mask_radius
+
+    q_is_img  = q_idx  >= num_txt
+    kv_is_img = kv_idx >= num_txt
+    q_img  = q_idx  - num_txt
+    kv_img = kv_idx - num_txt
+    q_row,  q_col  = q_img  // W, q_img  % W
+    kv_row, kv_col = kv_img // W, kv_img % W
+    in_window = (torch.abs(q_row - kv_row) <= radius) & \
+                (torch.abs(q_col - kv_col) <= radius)
+    return ~(q_is_img & kv_is_img) | in_window
 
 def _make_block_mask(
     radius: int,
@@ -240,35 +259,61 @@ def _make_block_mask(
     W: int,
     device: torch.device,
 ) -> Any:
-    """Return a flex_attention.BlockMask encoding Chebyshev-local image attention (for dispatch efficiency).
-
-    Text tokens attend to everything; image token i attends to image token j iff
-    max(|row_i - row_j|, |col_i - col_j|) <= radius.
-    Cached in AttnStore._cached_block_mask; separate from the float mask used for heatmap.
-    """
     import torch.nn.attention.flex_attention as flex_attention
 
     cache_key = (radius, num_txt, seq_total, W)
     if AttnStore._cached_block_mask is not None and AttnStore._cached_block_mask_key == cache_key:
         return AttnStore._cached_block_mask
 
-    def mask_mod(_b, _h, q_idx, kv_idx):
-        q_is_img  = q_idx  >= num_txt
-        kv_is_img = kv_idx >= num_txt
-        q_img  = q_idx  - num_txt
-        kv_img = kv_idx - num_txt
-        q_row,  q_col  = q_img  // W, q_img  % W
-        kv_row, kv_col = kv_img // W, kv_img % W
-        in_window = (torch.abs(q_row - kv_row) <= radius) & \
-                    (torch.abs(q_col - kv_col) <= radius)
-        return ~(q_is_img & kv_is_img) | in_window
+    # 把参数写入 AttnStore，让顶层函数能读到
+    AttnStore._mask_radius  = radius
+    AttnStore._mask_num_txt = num_txt
+    AttnStore._mask_W       = W
 
     block_mask = flex_attention.create_block_mask(
-        mask_mod, B=None, H=None, Q_LEN=seq_total, KV_LEN=seq_total, device=device
+        _chebyshev_mask_mod,  # 固定的顶层函数，dynamo 可以 cache
+        B=None, H=None, Q_LEN=seq_total, KV_LEN=seq_total, device=device
     )
-    AttnStore._cached_block_mask = block_mask
+    AttnStore._cached_block_mask     = block_mask
     AttnStore._cached_block_mask_key = cache_key
     return block_mask
+
+# def _make_block_mask(
+#     radius: int,
+#     num_txt: int,
+#     seq_total: int,
+#     W: int,
+#     device: torch.device,
+# ) -> Any:
+#     """Return a flex_attention.BlockMask encoding Chebyshev-local image attention (for dispatch efficiency).
+
+#     Text tokens attend to everything; image token i attends to image token j iff
+#     max(|row_i - row_j|, |col_i - col_j|) <= radius.
+#     Cached in AttnStore._cached_block_mask; separate from the float mask used for heatmap.
+#     """
+#     import torch.nn.attention.flex_attention as flex_attention
+
+#     cache_key = (radius, num_txt, seq_total, W)
+#     if AttnStore._cached_block_mask is not None and AttnStore._cached_block_mask_key == cache_key:
+#         return AttnStore._cached_block_mask
+
+#     def mask_mod(_b, _h, q_idx, kv_idx):
+#         q_is_img  = q_idx  >= num_txt
+#         kv_is_img = kv_idx >= num_txt
+#         q_img  = q_idx  - num_txt
+#         kv_img = kv_idx - num_txt
+#         q_row,  q_col  = q_img  // W, q_img  % W
+#         kv_row, kv_col = kv_img // W, kv_img % W
+#         in_window = (torch.abs(q_row - kv_row) <= radius) & \
+#                     (torch.abs(q_col - kv_col) <= radius)
+#         return ~(q_is_img & kv_is_img) | in_window
+
+#     block_mask = flex_attention.create_block_mask(
+#         mask_mod, B=None, H=None, Q_LEN=seq_total, KV_LEN=seq_total, device=device
+#     )
+#     AttnStore._cached_block_mask = block_mask
+#     AttnStore._cached_block_mask_key = cache_key
+#     return block_mask
 
 
 class Flux2AttnProcessor:
@@ -333,7 +378,7 @@ class Flux2AttnProcessor:
                 AttnStore.add(probs.cpu())
                 del q_img, k_img, scores, probs
 
-        if AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
+        if AttnStore.use_flex_dispatch and AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
             W_GRID = int(math.isqrt(query.shape[1] - num_txt))
             block_mask = _make_block_mask(AttnStore._block_radius, num_txt, query.shape[1], W_GRID, query.device)
             hidden_states = dispatch_attention_fn(
@@ -496,7 +541,7 @@ class Flux2ParallelSelfAttnProcessor:
                 AttnStore.add(probs.cpu())
                 del q_img, k_img, scores, probs
 
-        if AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
+        if AttnStore.use_flex_dispatch and AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
             W_GRID = int(math.isqrt(query.shape[1] - num_txt))
             block_mask = _make_block_mask(AttnStore._block_radius, num_txt, query.shape[1], W_GRID, query.device)
             hidden_states = dispatch_attention_fn(
