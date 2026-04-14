@@ -27,7 +27,7 @@ from ...loaders import FluxTransformer2DLoadersMixin, FromOriginalModelMixin, Pe
 from ...utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
 from .._modeling_parallel import ContextParallelInput, ContextParallelOutput
 from ..attention import AttentionMixin, AttentionModuleMixin
-from ..attention_dispatch import dispatch_attention_fn
+from ..attention_dispatch import dispatch_attention_fn, AttentionBackendName
 from ..cache_utils import CacheMixin
 from ..embeddings import (
     TimestepEmbedding,
@@ -171,16 +171,20 @@ class AttnStore:
     num_txt_tokens: int = 0
     img_ids: Optional[torch.Tensor] = None  # (Seq_img, 4) – [t, row, col, layer]
     _maps: list = []
-    _cached_mask: Optional[torch.Tensor] = None   # cached blocked mask, reused across blocks
+    _cached_mask: Optional[torch.Tensor] = None   # cached float mask, reused across blocks
     _cache_key: tuple = ()                         # (radius, num_txt, seq_total, device, dtype)
+    _cached_block_mask: Optional[Any] = None       # cached flex_attention.BlockMask for dispatch
+    _cached_block_mask_key: tuple = ()             # (radius, num_txt, seq_total, W)
 
     @classmethod
     def set_block_radius(cls, radius: Optional[int]) -> None:
-        """Set the resolved block radius and invalidate the mask cache if changed."""
+        """Set the resolved block radius and invalidate both mask caches if changed."""
         if cls._block_radius != radius:
             cls._block_radius = radius
             cls._cached_mask = None
             cls._cache_key = ()
+            cls._cached_block_mask = None
+            cls._cached_block_mask_key = ()
 
     @classmethod
     def reset(cls) -> None:
@@ -229,6 +233,44 @@ def _make_blocked_mask(
     return mask
 
 
+def _make_block_mask(
+    radius: int,
+    num_txt: int,
+    seq_total: int,
+    W: int,
+    device: torch.device,
+) -> Any:
+    """Return a flex_attention.BlockMask encoding Chebyshev-local image attention (for dispatch efficiency).
+
+    Text tokens attend to everything; image token i attends to image token j iff
+    max(|row_i - row_j|, |col_i - col_j|) <= radius.
+    Cached in AttnStore._cached_block_mask; separate from the float mask used for heatmap.
+    """
+    import torch.nn.attention.flex_attention as flex_attention
+
+    cache_key = (radius, num_txt, seq_total, W)
+    if AttnStore._cached_block_mask is not None and AttnStore._cached_block_mask_key == cache_key:
+        return AttnStore._cached_block_mask
+
+    def mask_mod(_b, _h, q_idx, kv_idx):
+        q_is_img  = q_idx  >= num_txt
+        kv_is_img = kv_idx >= num_txt
+        q_img  = q_idx  - num_txt
+        kv_img = kv_idx - num_txt
+        q_row,  q_col  = q_img  // W, q_img  % W
+        kv_row, kv_col = kv_img // W, kv_img % W
+        in_window = (torch.abs(q_row - kv_row) <= radius) & \
+                    (torch.abs(q_col - kv_col) <= radius)
+        return ~(q_is_img & kv_is_img) | in_window
+
+    block_mask = flex_attention.create_block_mask(
+        mask_mod, B=None, H=None, Q_LEN=seq_total, KV_LEN=seq_total, device=device
+    )
+    AttnStore._cached_block_mask = block_mask
+    AttnStore._cached_block_mask_key = cache_key
+    return block_mask
+
+
 class Flux2AttnProcessor:
     _attention_backend = None
     _parallel_config = None
@@ -269,39 +311,44 @@ class Flux2AttnProcessor:
             value = torch.cat([encoder_value, value], dim=1)
 
         if image_rotary_emb is not None:
-            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)  # type: ignore[assignment]
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)  # type: ignore[assignment]
 
         num_txt = AttnStore.num_txt_tokens
 
-        # --- Blocked (spatially local) attention mask ---
-        if AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
-            blocked_mask = _make_blocked_mask(
-                AttnStore.img_ids, AttnStore._block_radius,
-                num_txt, query.shape[1], query.device, query.dtype,
-            )
-            attention_mask = blocked_mask if attention_mask is None else attention_mask + blocked_mask
-
-        # --- Image self-attention heatmap capture (after mask, reflects blocking) ---
+        # --- Image self-attention heatmap capture (reflects blocking when active) ---
         if AttnStore.enabled and query.shape[1] > num_txt:
             with torch.no_grad():
                 q_img = query[:, num_txt:].transpose(1, 2)  # (B, H, Seq_img, D)
                 k_img = key[:, num_txt:].transpose(1, 2)
                 scores = torch.matmul(q_img, k_img.transpose(-1, -2)) / math.sqrt(q_img.size(-1))
-                if attention_mask is not None:
-                    scores = scores + attention_mask[num_txt:, num_txt:].unsqueeze(0).unsqueeze(0)
+                if AttnStore._block_radius is not None and AttnStore.img_ids is not None:
+                    # Apply float mask so heatmap shows blocked attention
+                    blocked_mask = _make_blocked_mask(
+                        AttnStore.img_ids, AttnStore._block_radius,
+                        num_txt, query.shape[1], query.device, query.dtype,
+                    )
+                    scores = scores + blocked_mask[num_txt:, num_txt:].unsqueeze(0).unsqueeze(0)
                 probs = torch.softmax(scores, dim=-1).mean(dim=(0, 1))  # (Seq_img, Seq_img)
                 AttnStore.add(probs.cpu())
                 del q_img, k_img, scores, probs
-        
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+
+        if AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
+            W_GRID = int(math.isqrt(query.shape[1] - num_txt))
+            block_mask = _make_block_mask(AttnStore._block_radius, num_txt, query.shape[1], W_GRID, query.device)
+            hidden_states = dispatch_attention_fn(
+                query, key, value,
+                attn_mask=block_mask,
+                backend=AttentionBackendName.FLEX,
+                parallel_config=self._parallel_config,
+            )
+        else:
+            hidden_states = dispatch_attention_fn(
+                query, key, value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -427,39 +474,44 @@ class Flux2ParallelSelfAttnProcessor:
         key = attn.norm_k(key)
 
         if image_rotary_emb is not None:
-            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)  # type: ignore[assignment]
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)  # type: ignore[assignment]
 
         num_txt = AttnStore.num_txt_tokens
 
-        # --- Blocked (spatially local) attention mask ---
-        if AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
-            blocked_mask = _make_blocked_mask(
-                AttnStore.img_ids, AttnStore._block_radius,
-                num_txt, query.shape[1], query.device, query.dtype,
-            )
-            attention_mask = blocked_mask if attention_mask is None else attention_mask + blocked_mask
-
-        # --- Image self-attention heatmap capture (after mask, reflects blocking) ---
+        # --- Image self-attention heatmap capture (reflects blocking when active) ---
         if AttnStore.enabled and query.shape[1] > num_txt:
             with torch.no_grad():
                 q_img = query[:, num_txt:].transpose(1, 2)  # (B, H, Seq_img, D)
                 k_img = key[:, num_txt:].transpose(1, 2)
                 scores = torch.matmul(q_img, k_img.transpose(-1, -2)) / math.sqrt(q_img.size(-1))
-                if attention_mask is not None:
-                    scores = scores + attention_mask[num_txt:, num_txt:].unsqueeze(0).unsqueeze(0)
+                if AttnStore._block_radius is not None and AttnStore.img_ids is not None:
+                    # Apply float mask so heatmap shows blocked attention
+                    blocked_mask = _make_blocked_mask(
+                        AttnStore.img_ids, AttnStore._block_radius,
+                        num_txt, query.shape[1], query.device, query.dtype,
+                    )
+                    scores = scores + blocked_mask[num_txt:, num_txt:].unsqueeze(0).unsqueeze(0)
                 probs = torch.softmax(scores, dim=-1).mean(dim=(0, 1))  # (Seq_img, Seq_img)
                 AttnStore.add(probs.cpu())
                 del q_img, k_img, scores, probs
 
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+        if AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt:
+            W_GRID = int(math.isqrt(query.shape[1] - num_txt))
+            block_mask = _make_block_mask(AttnStore._block_radius, num_txt, query.shape[1], W_GRID, query.device)
+            hidden_states = dispatch_attention_fn(
+                query, key, value,
+                attn_mask=block_mask,
+                backend=AttentionBackendName.FLEX,
+                parallel_config=self._parallel_config,
+            )
+        else:
+            hidden_states = dispatch_attention_fn(
+                query, key, value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
