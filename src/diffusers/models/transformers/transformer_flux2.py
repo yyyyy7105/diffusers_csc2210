@@ -626,14 +626,6 @@ class BlockSparseConfig:
             Maps ``(block_type, block_index)`` → ``torch.BoolTensor [NB, NB]``
             where ``NB = S // block_size``.  Built from profiling data; only
             blocks with an entry here receive a sparse processor.
-        img_connectivity_maps:
-            Image-only sub-maps for single-stream blocks.  Maps
-            ``("single", block_index)`` → ``torch.BoolTensor [NB_img, NB_img]``
-            where ``NB_img = N_img // block_size``.  Populated by
-            ``set_block_sparse_attention`` from the I→I quadrant of the full
-            connectivity map.  Used by ``Flux2BlockSparseSelfAttnProcessor`` to
-            reconstruct the correct full map at runtime regardless of the current
-            prompt length (``current_num_txt_tokens``).
         timestep_threshold:
             Normalised timestep (0 = clean, 1 = full noise) below which sparse
             attention is active.  At high-noise timesteps (t ≈ 1) attention is
@@ -645,20 +637,13 @@ class BlockSparseConfig:
         current_timestep:
             Updated by ``Flux2Transformer2DModel.forward()`` before each
             denoising step.  Processors read this value to gate activation.
-        current_num_txt_tokens:
-            Number of text tokens in the current forward pass.  Updated by
-            ``Flux2Transformer2DModel.forward()`` before the single-stream
-            block loop so that ``Flux2BlockSparseSelfAttnProcessor`` can
-            reconstruct the prompt-length-aware full connectivity map.
     """
 
     enabled: bool = False
     connectivity_maps: Dict[Tuple[str, int], torch.BoolTensor] = field(default_factory=dict)
-    img_connectivity_maps: Dict[Tuple[str, int], torch.BoolTensor] = field(default_factory=dict)
     timestep_threshold: float = 0.5
     block_size: int = 64
     current_timestep: float = 1.0
-    current_num_txt_tokens: int = 0
 
 
 class Flux2BlockSparseAttnProcessor:
@@ -832,35 +817,13 @@ class Flux2BlockSparseSelfAttnProcessor:
         )
 
         if use_sparse:
-            # Reconstruct the full [NB_full, NB_full] connectivity map from the
-            # stored image-only sub-map so that the map stays correct regardless
-            # of the current prompt length (number of text tokens).
-            #
-            # Single-stream input is [txt || img].  Text tokens (variable length)
-            # occupy the first N_txt positions; image tokens (fixed for a given
-            # resolution) occupy the rest.  Spatial locality only exists in the
-            # I→I quadrant; T→*, *→T blocks are kept fully dense.
-            if self._map_key in cfg.img_connectivity_maps:
-                img_conn = cfg.img_connectivity_maps[self._map_key]  # [NB_img, NB_img]
-                block_size = cfg.block_size
-                N_txt = cfg.current_num_txt_tokens
-                NB_txt = N_txt // block_size          # floor: text blocks in the map
-                NB_img = img_conn.shape[0]
-                NB_full = NB_txt + NB_img
-                # All-True (dense) base; then overlay the sparse I→I sub-map.
-                conn = torch.ones(NB_full, NB_full, dtype=torch.bool, device=img_conn.device)
-                conn[NB_txt:, NB_txt:] = img_conn
-            else:
-                # Backward-compatible path: use the full map as stored.
-                conn = cfg.connectivity_maps[self._map_key]
-
             # query/key/value are [B, S, H, D]; kernel expects [B, H, S, D]
             q_bhsd = query.transpose(1, 2)
             k_bhsd = key.transpose(1, 2)
             v_bhsd = value.transpose(1, 2)
             hidden_states = triton_block_sparse_attention(
                 q_bhsd, k_bhsd, v_bhsd,
-                conn,
+                cfg.connectivity_maps[self._map_key],
                 cfg.block_size,
             )
             hidden_states = hidden_states.transpose(1, 2)  # back to [B, S, H, D]
@@ -1549,7 +1512,6 @@ class Flux2Transformer2DModel(
         connectivity_maps: Dict[Tuple[str, int], torch.BoolTensor],
         timestep_threshold: float = 0.5,
         block_size: int = 64,
-        num_txt_tokens: int = 0,
     ) -> None:
         """Install block-sparse Triton attention processors on selected blocks.
 
@@ -1583,20 +1545,6 @@ class Flux2Transformer2DModel(
             block_size:
                 Tile size in tokens.  Must divide the full sequence length S.
                 Defaults to 64.
-            num_txt_tokens:
-                Number of text tokens that were present in the sequence during
-                profiling (i.e. ``encoder_hidden_states.shape[1]`` at profiling
-                time).  **Required when** ``connectivity_maps`` contains any
-                ``"single"`` keys.
-
-                For each single-stream block the full ``[NB, NB]`` connectivity
-                map (which covers ``[txt || img]`` tokens) is decomposed: the
-                I→I sub-matrix ``conn[NB_txt:, NB_txt:]`` is stored separately
-                (where ``NB_txt = num_txt_tokens // block_size``).  At runtime
-                the processor reconstructs the correct full map for the actual
-                prompt length, keeping T→*, *→T blocks fully dense and reusing
-                the fixed I→I sparsity pattern.  This makes the sparse processors
-                robust to prompts with a different length than the profiling run.
 
         Example::
 
@@ -1605,7 +1553,6 @@ class Flux2Transformer2DModel(
                 connectivity_maps=connectivity_maps,  # {("single", i): conn_i, ...}
                 timestep_threshold=0.5,
                 block_size=64,
-                num_txt_tokens=512,   # max_sequence_length used during profiling
             )
         """
         cfg = self._block_sparse_config
@@ -1614,31 +1561,6 @@ class Flux2Transformer2DModel(
         cfg.timestep_threshold = timestep_threshold
         cfg.block_size = block_size
         cfg.current_timestep = 1.0  # start at "full noise"
-        cfg.current_num_txt_tokens = 0  # will be updated by forward()
-
-        # Build image-only sub-maps for single-stream blocks so that the
-        # processor can adapt to variable prompt lengths at runtime.
-        cfg.img_connectivity_maps = {}
-        if num_txt_tokens > 0:
-            NB_txt = num_txt_tokens // block_size
-            for key, conn in connectivity_maps.items():
-                if key[0] == "single":
-                    if NB_txt > conn.shape[0]:
-                        logger.warning(
-                            f"set_block_sparse_attention: num_txt_tokens={num_txt_tokens} "
-                            f"implies NB_txt={NB_txt} which exceeds the map size "
-                            f"{conn.shape[0]} for {key}. Skipping img sub-map extraction."
-                        )
-                        continue
-                    cfg.img_connectivity_maps[key] = conn[NB_txt:, NB_txt:].clone()
-        elif any(k[0] == "single" for k in connectivity_maps):
-            logger.warning(
-                "set_block_sparse_attention: connectivity_maps contains single-stream "
-                "block(s) but num_txt_tokens=0.  Pass the number of text tokens used "
-                "during profiling (e.g. num_txt_tokens=512) so that the sparse "
-                "processor can adapt to different prompt lengths at runtime.  "
-                "Falling back to the stored full map (prompt-length-sensitive)."
-            )
 
         sparse_double = 0
         sparse_single = 0
@@ -1672,7 +1594,6 @@ class Flux2Transformer2DModel(
         """
         self._block_sparse_config.enabled = False
         self._block_sparse_config.connectivity_maps = {}
-        self._block_sparse_config.img_connectivity_maps = {}
 
         for block in self.transformer_blocks:
             block.attn.set_processor(Flux2AttnProcessor())
@@ -1807,12 +1728,6 @@ class Flux2Transformer2DModel(
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         # 5. Single Stream Transformer Blocks
-        # Update the block-sparse config with the current text token count so that
-        # Flux2BlockSparseSelfAttnProcessor can reconstruct a prompt-length-aware
-        # full connectivity map from the stored image-only sub-maps.
-        if block_sparse_cfg.enabled:
-            block_sparse_cfg.current_num_txt_tokens = num_txt_tokens
-
         for index_block, block in enumerate(self.single_transformer_blocks):
             if profiling_store.enabled:
                 profiling_store.current_block_type = "single"
