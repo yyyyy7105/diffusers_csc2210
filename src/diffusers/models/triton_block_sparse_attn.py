@@ -174,7 +174,9 @@ def _masked_attention_pytorch(
     # True  = attend, False = mask out
     expanded = conn.unsqueeze(1).unsqueeze(3).expand(NB, block_size, NB, block_size)
     token_mask = expanded.reshape(NB * block_size, NB * block_size)[:S, :S]  # trim any padding
-    attn_mask = torch.where(token_mask, torch.zeros(1, device=query.device, dtype=query.dtype), torch.full((1,), float("-inf"), device=query.device, dtype=query.dtype))
+    zeros = torch.zeros(1, device=query.device, dtype=query.dtype)
+    neg_inf = torch.full((1,), float("-inf"), device=query.device, dtype=query.dtype)
+    attn_mask = torch.where(token_mask, zeros, neg_inf)
     return F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
 
 
@@ -245,7 +247,7 @@ def triton_block_sparse_attention(
     value = value.contiguous()
 
     out = torch.empty_like(query)
-    scale = math.sqrt(D) ** -1
+    scale = 1.0 / math.sqrt(D)
 
     grid = (B, H, NB)
     _block_sparse_attn_fwd_kernel[grid](

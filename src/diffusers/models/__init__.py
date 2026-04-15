@@ -219,6 +219,8 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             Flux2BlockSparseSelfAttnProcessor,
             Flux2Transformer2DModel,
             FluxTransformer2DModel,
+            GlmImageTransformer2DModel,
+            HiDreamImageTransformer2DModel,
             HunyuanDiT2DModel,
             HunyuanImageTransformer2DModel,
             HunyuanVideo15Transformer3DModel,
