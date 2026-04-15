@@ -189,3 +189,6 @@ wandb
 
 # Profiler Logs
 log/
+
+# whl
+*.whl

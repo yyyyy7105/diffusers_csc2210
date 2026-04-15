@@ -168,6 +168,8 @@ class AttnStore:
     """
 
     enabled: bool = False
+    use_z_order: bool = False             # if True, reorder image tokens by Morton code before sliding window (gives 2D block-like pattern; False gives horizontal stripes)
+    use_exact_chebyshev_mask: bool = False  # if True, Pass 2 uses exact Chebyshev float mask + manual softmax instead of FA2 sliding window
     _block_radius: Optional[int] = None  # always a resolved int; use set_block_radius() to write
     num_txt_tokens: int = 0
     img_ids: Optional[torch.Tensor] = None  # (Seq_img, 4) – [t, row, col, layer]
@@ -318,42 +320,64 @@ class Flux2AttnProcessor:
                 AttnStore.add(probs.cpu())
                 del q_img, k_img, scores, probs
 
-        if AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt and num_txt > 0:
-            z_key = AttnStore.img_ids.shape[0]
-            if AttnStore._cached_z_sort is None or AttnStore._cached_z_key != z_key:
-                sort_idx, unsort_idx = _morton_sort_indices(AttnStore.img_ids)
-                AttnStore._cached_z_sort   = sort_idx
-                AttnStore._cached_z_unsort = unsort_idx
-                AttnStore._cached_z_key    = z_key
-            sort_idx   = AttnStore._cached_z_sort.to(query.device)
-            unsort_idx = AttnStore._cached_z_unsort.to(query.device)
-
+        if AttnStore._block_radius is not None and query.shape[1] > num_txt and num_txt > 0:
             q_txt = query[:, :num_txt];  q_img = query[:, num_txt:]
             k_txt = key[:,   :num_txt];  k_img = key[:,   num_txt:]
             v_txt = value[:, :num_txt];  v_img = value[:, num_txt:]
 
-            q_img_z = q_img[:, sort_idx]
-            k_img_z = k_img[:, sort_idx]
-            v_img_z = v_img[:, sort_idx]
-
-            # Pass 1: image × text (full cross-attention, LSE needed for combination)
+            # Pass 1: image × text — full cross-attention (image sees all text tokens)
             out_img_txt, lse_txt, _ = flash_attn_func(q_img, k_txt, v_txt, return_attn_probs=True)
 
-            # Pass 2: image × image Z-order windowed attention (LSE needed for combination)
-            window = (2 * AttnStore._block_radius + 1) ** 2
-            out_img_z, lse_img_z, _ = flash_attn_func(
-                q_img_z, k_img_z, v_img_z, window_size=(window, window), return_attn_probs=True,
-            )
-            out_img_img = out_img_z[:, unsort_idx]       # (B, num_img, H, D) in original order
-            lse_img     = lse_img_z[:, :, unsort_idx]    # (B, H, num_img) in original order
+            # Pass 2: image × image
+            if AttnStore.use_exact_chebyshev_mask and AttnStore.img_ids is not None:
+                # Exact Chebyshev masking via manual softmax — no FLOPs savings, but exact coverage
+                blocked_mask = _make_blocked_mask(
+                    AttnStore.img_ids, AttnStore._block_radius,
+                    num_txt, query.shape[1], query.device, query.dtype,
+                )
+                img_img_mask = blocked_mask[num_txt:, num_txt:]
+                scale = 1.0 / math.sqrt(q_img.shape[-1])
+                q_t = q_img.transpose(1, 2)
+                k_t = k_img.transpose(1, 2)
+                v_t = v_img.transpose(1, 2)
+                scores = torch.matmul(q_t, k_t.transpose(-1, -2)) * scale + img_img_mask
+                lse_img_w = torch.logsumexp(scores, dim=-1)   # (B, H, num_img)
+                out_img_w = torch.matmul(torch.softmax(scores, dim=-1), v_t).transpose(1, 2)
+            else:
+                # FA2 sliding window (approximate Chebyshev, skips blocked Q@K^T)
+                W_img = int(math.isqrt(query.shape[1] - num_txt))
+                if AttnStore.use_z_order and AttnStore.img_ids is not None:
+                    z_key = AttnStore.img_ids.shape[0]
+                    if AttnStore._cached_z_sort is None or AttnStore._cached_z_key != z_key:
+                        sort_idx, unsort_idx = _morton_sort_indices(AttnStore.img_ids)
+                        AttnStore._cached_z_sort   = sort_idx
+                        AttnStore._cached_z_unsort = unsort_idx
+                        AttnStore._cached_z_key    = z_key
+                    sort_idx   = AttnStore._cached_z_sort.to(query.device)
+                    unsort_idx = AttnStore._cached_z_unsort.to(query.device)
+                    q_img_w = q_img[:, sort_idx]
+                    k_img_w = k_img[:, sort_idx]
+                    v_img_w = v_img[:, sort_idx]
+                    window = (2 * AttnStore._block_radius + 1) ** 2
+                else:
+                    q_img_w, k_img_w, v_img_w = q_img, k_img, v_img
+                    unsort_idx = None
+                    window = AttnStore._block_radius * (W_img + 1)
 
-            # Exact combination: log-sum-exp merge of text and image key contributions
-            lse_combined = torch.logaddexp(lse_txt, lse_img)
-            w_txt = torch.exp(lse_txt - lse_combined).permute(0, 2, 1).unsqueeze(-1)
-            w_img = torch.exp(lse_img - lse_combined).permute(0, 2, 1).unsqueeze(-1)
-            out_img = w_txt * out_img_txt + w_img * out_img_img  # (B, num_img, H, D)
+                out_img_w, lse_img_w, _ = flash_attn_func(
+                    q_img_w, k_img_w, v_img_w, window_size=(window, window), return_attn_probs=True,
+                )
+                if unsort_idx is not None:
+                    out_img_w  = out_img_w[:, unsort_idx]
+                    lse_img_w  = lse_img_w[:, :, unsort_idx]
 
-            # Pass 3: text × all (full attention, no combination needed)
+            # Exact combination via log-sum-exp
+            lse_combined = torch.logaddexp(lse_txt, lse_img_w)
+            w_txt = torch.exp(lse_txt  - lse_combined).permute(0, 2, 1).unsqueeze(-1)
+            w_img = torch.exp(lse_img_w - lse_combined).permute(0, 2, 1).unsqueeze(-1)
+            out_img = w_txt * out_img_txt + w_img * out_img_w  # (B, num_img, H, D)
+
+            # Pass 3: text × all — full attention (text sees everything)
             out_txt = flash_attn_func(q_txt, key, value)
 
             hidden_states = torch.cat([out_txt, out_img], dim=1)  # (B, seq_total, H, D)
@@ -511,42 +535,64 @@ class Flux2ParallelSelfAttnProcessor:
                 AttnStore.add(probs.cpu())
                 del q_img, k_img, scores, probs
 
-        if AttnStore._block_radius is not None and AttnStore.img_ids is not None and query.shape[1] > num_txt and num_txt > 0:
-            z_key = AttnStore.img_ids.shape[0]
-            if AttnStore._cached_z_sort is None or AttnStore._cached_z_key != z_key:
-                sort_idx, unsort_idx = _morton_sort_indices(AttnStore.img_ids)
-                AttnStore._cached_z_sort   = sort_idx
-                AttnStore._cached_z_unsort = unsort_idx
-                AttnStore._cached_z_key    = z_key
-            sort_idx   = AttnStore._cached_z_sort.to(query.device)
-            unsort_idx = AttnStore._cached_z_unsort.to(query.device)
-
+        if AttnStore._block_radius is not None and query.shape[1] > num_txt and num_txt > 0:
             q_txt = query[:, :num_txt];  q_img = query[:, num_txt:]
             k_txt = key[:,   :num_txt];  k_img = key[:,   num_txt:]
             v_txt = value[:, :num_txt];  v_img = value[:, num_txt:]
 
-            q_img_z = q_img[:, sort_idx]
-            k_img_z = k_img[:, sort_idx]
-            v_img_z = v_img[:, sort_idx]
-
-            # Pass 1: image × text (full cross-attention, LSE needed for combination)
+            # Pass 1: image × text — full cross-attention (image sees all text tokens)
             out_img_txt, lse_txt, _ = flash_attn_func(q_img, k_txt, v_txt, return_attn_probs=True)
 
-            # Pass 2: image × image Z-order windowed attention (LSE needed for combination)
-            window = (2 * AttnStore._block_radius + 1) ** 2
-            out_img_z, lse_img_z, _ = flash_attn_func(
-                q_img_z, k_img_z, v_img_z, window_size=(window, window), return_attn_probs=True,
-            )
-            out_img_img = out_img_z[:, unsort_idx]       # (B, num_img, H, D) in original order
-            lse_img     = lse_img_z[:, :, unsort_idx]    # (B, H, num_img) in original order
+            # Pass 2: image × image
+            if AttnStore.use_exact_chebyshev_mask and AttnStore.img_ids is not None:
+                # Exact Chebyshev masking via manual softmax — no FLOPs savings, but exact coverage
+                blocked_mask = _make_blocked_mask(
+                    AttnStore.img_ids, AttnStore._block_radius,
+                    num_txt, query.shape[1], query.device, query.dtype,
+                )
+                img_img_mask = blocked_mask[num_txt:, num_txt:]
+                scale = 1.0 / math.sqrt(q_img.shape[-1])
+                q_t = q_img.transpose(1, 2)
+                k_t = k_img.transpose(1, 2)
+                v_t = v_img.transpose(1, 2)
+                scores = torch.matmul(q_t, k_t.transpose(-1, -2)) * scale + img_img_mask
+                lse_img_w = torch.logsumexp(scores, dim=-1)   # (B, H, num_img)
+                out_img_w = torch.matmul(torch.softmax(scores, dim=-1), v_t).transpose(1, 2)
+            else:
+                # FA2 sliding window (approximate Chebyshev, skips blocked Q@K^T)
+                W_img = int(math.isqrt(query.shape[1] - num_txt))
+                if AttnStore.use_z_order and AttnStore.img_ids is not None:
+                    z_key = AttnStore.img_ids.shape[0]
+                    if AttnStore._cached_z_sort is None or AttnStore._cached_z_key != z_key:
+                        sort_idx, unsort_idx = _morton_sort_indices(AttnStore.img_ids)
+                        AttnStore._cached_z_sort   = sort_idx
+                        AttnStore._cached_z_unsort = unsort_idx
+                        AttnStore._cached_z_key    = z_key
+                    sort_idx   = AttnStore._cached_z_sort.to(query.device)
+                    unsort_idx = AttnStore._cached_z_unsort.to(query.device)
+                    q_img_w = q_img[:, sort_idx]
+                    k_img_w = k_img[:, sort_idx]
+                    v_img_w = v_img[:, sort_idx]
+                    window = (2 * AttnStore._block_radius + 1) ** 2
+                else:
+                    q_img_w, k_img_w, v_img_w = q_img, k_img, v_img
+                    unsort_idx = None
+                    window = AttnStore._block_radius * (W_img + 1)
 
-            # Exact combination: log-sum-exp merge of text and image key contributions
-            lse_combined = torch.logaddexp(lse_txt, lse_img)
-            w_txt = torch.exp(lse_txt - lse_combined).permute(0, 2, 1).unsqueeze(-1)
-            w_img = torch.exp(lse_img - lse_combined).permute(0, 2, 1).unsqueeze(-1)
-            out_img = w_txt * out_img_txt + w_img * out_img_img  # (B, num_img, H, D)
+                out_img_w, lse_img_w, _ = flash_attn_func(
+                    q_img_w, k_img_w, v_img_w, window_size=(window, window), return_attn_probs=True,
+                )
+                if unsort_idx is not None:
+                    out_img_w  = out_img_w[:, unsort_idx]
+                    lse_img_w  = lse_img_w[:, :, unsort_idx]
 
-            # Pass 3: text × all (full attention, no combination needed)
+            # Exact combination via log-sum-exp
+            lse_combined = torch.logaddexp(lse_txt, lse_img_w)
+            w_txt = torch.exp(lse_txt  - lse_combined).permute(0, 2, 1).unsqueeze(-1)
+            w_img = torch.exp(lse_img_w - lse_combined).permute(0, 2, 1).unsqueeze(-1)
+            out_img = w_txt * out_img_txt + w_img * out_img_w  # (B, num_img, H, D)
+
+            # Pass 3: text × all — full attention (text sees everything)
             out_txt = flash_attn_func(q_txt, key, value)
 
             hidden_states = torch.cat([out_txt, out_img], dim=1)  # (B, seq_total, H, D)

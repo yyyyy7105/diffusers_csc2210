@@ -2,8 +2,6 @@ import torch
 from diffusers import Flux2KleinPipeline, PipelineQuantizationConfig
 from transformers import BitsAndBytesConfig
 
-print(torch.__version__)
-print(torch.cuda.get_device_properties(0).shared_memory_per_block)
 
 device = "cuda"
 print(f"{torch.cuda.is_available()=}")
@@ -29,8 +27,6 @@ pipe = Flux2KleinPipeline.from_pretrained(
     torch_dtype=dtype,
     enable_profiler=enable_profiler,
 )
-
-pipe.transformer = torch.compile(pipe.transformer, mode="reduce-overhead")
 
 print(pipe.transformer.config)
 print("double blocks:", len(pipe.transformer.transformer_blocks))
