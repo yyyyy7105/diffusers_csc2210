@@ -97,7 +97,13 @@ if is_torch_available():
     _import_structure["transformers.transformer_cosmos"] = ["CosmosTransformer3DModel"]
     _import_structure["transformers.transformer_easyanimate"] = ["EasyAnimateTransformer3DModel"]
     _import_structure["transformers.transformer_flux"] = ["FluxTransformer2DModel"]
-    _import_structure["transformers.transformer_flux2"] = ["Flux2Transformer2DModel"]
+    _import_structure["transformers.transformer_flux2"] = [
+        "BlockSparseConfig",
+        "Flux2BlockSparseAttnProcessor",
+        "Flux2BlockSparseSelfAttnProcessor",
+        "Flux2Transformer2DModel",
+    ]
+    _import_structure["triton_block_sparse_attn"] = ["triton_block_sparse_attention"]
     _import_structure["transformers.transformer_glm_image"] = ["GlmImageTransformer2DModel"]
     _import_structure["transformers.transformer_hidream_image"] = ["HiDreamImageTransformer2DModel"]
     _import_structure["transformers.transformer_hunyuan_video"] = ["HunyuanVideoTransformer3DModel"]
@@ -145,6 +151,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
         from .adapter import MultiAdapter, T2IAdapter
         from .attention_dispatch import AttentionBackendName, attention_backend
         from .auto_model import AutoModel
+        from .triton_block_sparse_attn import triton_block_sparse_attention
         from .autoencoders import (
             AsymmetricAutoencoderKL,
             AutoencoderDC,
@@ -207,10 +214,11 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             DiTTransformer2DModel,
             DualTransformer2DModel,
             EasyAnimateTransformer3DModel,
+            BlockSparseConfig,
+            Flux2BlockSparseAttnProcessor,
+            Flux2BlockSparseSelfAttnProcessor,
             Flux2Transformer2DModel,
             FluxTransformer2DModel,
-            GlmImageTransformer2DModel,
-            HiDreamImageTransformer2DModel,
             HunyuanDiT2DModel,
             HunyuanImageTransformer2DModel,
             HunyuanVideo15Transformer3DModel,

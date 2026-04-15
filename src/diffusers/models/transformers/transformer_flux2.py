@@ -40,6 +40,7 @@ from ..embeddings import (
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
 from ..normalization import AdaLayerNormContinuous
+from ..triton_block_sparse_attn import triton_block_sparse_attention
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -597,6 +598,250 @@ class Flux2ProfilingSelfAttnProcessor:
         mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
 
         # Concatenate and parallel output projection
+        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+        hidden_states = attn.to_out(hidden_states)
+
+        return hidden_states
+
+
+# ---------------------------------------------------------------------------
+# Block-sparse attention infrastructure
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BlockSparseConfig:
+    """Configuration and runtime state for block-sparse attention in Flux2.
+
+    Attach one instance to ``Flux2Transformer2DModel._block_sparse_config``.
+    The model's ``forward()`` updates ``current_timestep`` before processing
+    each block so that processors can decide at run time whether to use sparse
+    attention.
+
+    Attributes:
+        enabled:
+            Master switch.  When ``False``, all processors fall back to dense
+            ``scaled_dot_product_attention``.
+        connectivity_maps:
+            Maps ``(block_type, block_index)`` → ``torch.BoolTensor [NB, NB]``
+            where ``NB = S // block_size``.  Built from profiling data; only
+            blocks with an entry here receive a sparse processor.
+        timestep_threshold:
+            Normalised timestep (0 = clean, 1 = full noise) below which sparse
+            attention is active.  At high-noise timesteps (t ≈ 1) attention is
+            globally distributed; locality emerges only at lower noise levels.
+            Default: 0.5 (apply sparse attention during the second half of
+            denoising where locality is strong).
+        block_size:
+            Number of tokens per tile.  Must divide the sequence length.
+        current_timestep:
+            Updated by ``Flux2Transformer2DModel.forward()`` before each
+            denoising step.  Processors read this value to gate activation.
+    """
+
+    enabled: bool = False
+    connectivity_maps: Dict[Tuple[str, int], torch.BoolTensor] = field(default_factory=dict)
+    timestep_threshold: float = 0.5
+    block_size: int = 64
+    current_timestep: float = 1.0
+
+
+class Flux2BlockSparseAttnProcessor:
+    """Attention processor for double-stream joint-attention blocks that
+    replaces dense SDPA with block-sparse attention when two conditions hold:
+
+    1. A connectivity map for this ``(block_type, block_index)`` pair exists in
+       the shared :class:`BlockSparseConfig`.
+    2. The current normalised timestep is **below** ``config.timestep_threshold``
+       (i.e., we are in the low-noise phase of denoising where image-token
+       attention exhibits strong spatial locality).
+
+    Otherwise the processor falls back to the standard dense SDPA path, making
+    it a drop-in replacement for :class:`Flux2AttnProcessor`.
+
+    Args:
+        config:       Shared :class:`BlockSparseConfig` (attached to the model).
+        block_index:  Index of this double-stream block (0-based).
+    """
+
+    _attention_backend = None
+    _parallel_config = None
+
+    def __init__(self, config: BlockSparseConfig, block_index: int):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(f"{self.__class__.__name__} requires PyTorch 2.0.")
+        self._config = config
+        self._block_index = block_index
+        self._map_key = ("double", block_index)
+
+    def __call__(
+        self,
+        attn: "Flux2Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if attn.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+
+            encoder_query = attn.norm_added_q(encoder_query)
+            encoder_key = attn.norm_added_k(encoder_key)
+
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        # Decide whether to use block-sparse attention
+        cfg = self._config
+        use_sparse = (
+            cfg.enabled
+            and self._map_key in cfg.connectivity_maps
+            and cfg.current_timestep < cfg.timestep_threshold
+        )
+
+        if use_sparse:
+            # query/key/value are [B, S, H, D]; kernel expects [B, H, S, D]
+            q_bhsd = query.transpose(1, 2)
+            k_bhsd = key.transpose(1, 2)
+            v_bhsd = value.transpose(1, 2)
+            hidden_states = triton_block_sparse_attention(
+                q_bhsd, k_bhsd, v_bhsd,
+                cfg.connectivity_maps[self._map_key],
+                cfg.block_size,
+            )
+            hidden_states = hidden_states.transpose(1, 2)  # back to [B, S, H, D]
+        else:
+            hidden_states = dispatch_attention_fn(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
+
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            )
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if encoder_hidden_states is not None:
+            return hidden_states, encoder_hidden_states
+        else:
+            return hidden_states
+
+
+class Flux2BlockSparseSelfAttnProcessor:
+    """Attention processor for single-stream self-attention blocks that
+    replaces dense SDPA with block-sparse attention when two conditions hold:
+
+    1. A connectivity map for this ``(block_type, block_index)`` pair exists in
+       the shared :class:`BlockSparseConfig`.
+    2. The current normalised timestep is **below** ``config.timestep_threshold``.
+
+    Otherwise the processor falls back to the standard dense SDPA path, making
+    it a drop-in replacement for :class:`Flux2ParallelSelfAttnProcessor`.
+
+    Args:
+        config:       Shared :class:`BlockSparseConfig` (attached to the model).
+        block_index:  Index of this single-stream block (0-based).
+    """
+
+    _attention_backend = None
+    _parallel_config = None
+
+    def __init__(self, config: BlockSparseConfig, block_index: int):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(f"{self.__class__.__name__} requires PyTorch 2.0.")
+        self._config = config
+        self._block_index = block_index
+        self._map_key = ("single", block_index)
+
+    def __call__(
+        self,
+        attn: "Flux2ParallelSelfAttention",
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Parallel in (QKV + MLP in) projection
+        hidden_states = attn.to_qkv_mlp_proj(hidden_states)
+        qkv, mlp_hidden_states = torch.split(
+            hidden_states, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
+        )
+
+        query, key, value = qkv.chunk(3, dim=-1)
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        # Decide whether to use block-sparse attention
+        cfg = self._config
+        use_sparse = (
+            cfg.enabled
+            and self._map_key in cfg.connectivity_maps
+            and cfg.current_timestep < cfg.timestep_threshold
+        )
+
+        if use_sparse:
+            # query/key/value are [B, S, H, D]; kernel expects [B, H, S, D]
+            q_bhsd = query.transpose(1, 2)
+            k_bhsd = key.transpose(1, 2)
+            v_bhsd = value.transpose(1, 2)
+            hidden_states = triton_block_sparse_attention(
+                q_bhsd, k_bhsd, v_bhsd,
+                cfg.connectivity_maps[self._map_key],
+                cfg.block_size,
+            )
+            hidden_states = hidden_states.transpose(1, 2)  # back to [B, S, H, D]
+        else:
+            hidden_states = dispatch_attention_fn(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
+
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
+
         hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
         hidden_states = attn.to_out(hidden_states)
 
@@ -1199,6 +1444,9 @@ class Flux2Transformer2DModel(
         # Attention profiling store (disabled by default)
         self._attention_profiling_store = AttentionProfilingStore()
 
+        # Block-sparse attention config (disabled by default)
+        self._block_sparse_config = BlockSparseConfig()
+
     def set_profiling_mode(
         self,
         enabled: bool,
@@ -1259,6 +1507,101 @@ class Flux2Transformer2DModel(
         """Clear all captured attention profile data."""
         self._attention_profiling_store.clear()
 
+    def set_block_sparse_attention(
+        self,
+        connectivity_maps: Dict[Tuple[str, int], torch.BoolTensor],
+        timestep_threshold: float = 0.5,
+        block_size: int = 64,
+    ) -> None:
+        """Install block-sparse Triton attention processors on selected blocks.
+
+        Only blocks that appear as keys in ``connectivity_maps`` receive sparse
+        processors; all other blocks keep standard dense SDPA.
+
+        The processors activate only when the **normalised denoising timestep**
+        (0 = clean image, 1 = full noise) is **below** ``timestep_threshold``.
+        At high-noise timesteps attention patterns are globally distributed;
+        spatial locality emerges in the low-noise (late denoising) phase and is
+        therefore the right regime for block-sparse acceleration.
+
+        The connectivity maps are typically derived from profiling data (see
+        ``attention_profiling.ipynb``, Section 15.2) by averaging full attention
+        weight tensors over prompts and timesteps, partitioning the sequence into
+        non-overlapping blocks of ``block_size`` tokens, and keeping block-pairs
+        whose mean attention weight exceeds a configurable sparsity threshold.
+
+        Args:
+            connectivity_maps:
+                Dictionary mapping ``(block_type, block_index)`` to a
+                ``[NB, NB]`` boolean tensor where ``NB = S // block_size``.
+                ``True`` means the query-block attends to the key-block.
+                Keys use ``block_type in {"double", "single"}`` and
+                ``block_index`` as a 0-based integer.
+                Only blocks present as keys receive sparse processors.
+            timestep_threshold:
+                Normalised timestep below which sparse attention is active.
+                Defaults to 0.5 (sparse attention during the second half of
+                denoising where locality is strong).
+            block_size:
+                Tile size in tokens.  Must divide the full sequence length S.
+                Defaults to 64.
+
+        Example::
+
+            # After running the profiling notebook and building connectivity_maps:
+            pipe.transformer.set_block_sparse_attention(
+                connectivity_maps=connectivity_maps,  # {("single", i): conn_i, ...}
+                timestep_threshold=0.5,
+                block_size=64,
+            )
+        """
+        cfg = self._block_sparse_config
+        cfg.enabled = True
+        cfg.connectivity_maps = dict(connectivity_maps)
+        cfg.timestep_threshold = timestep_threshold
+        cfg.block_size = block_size
+        cfg.current_timestep = 1.0  # start at "full noise"
+
+        sparse_double = 0
+        sparse_single = 0
+
+        for bi, block in enumerate(self.transformer_blocks):
+            key = ("double", bi)
+            if key in cfg.connectivity_maps:
+                block.attn.set_processor(Flux2BlockSparseAttnProcessor(cfg, bi))
+                sparse_double += 1
+            else:
+                block.attn.set_processor(Flux2AttnProcessor())
+
+        for bi, block in enumerate(self.single_transformer_blocks):
+            key = ("single", bi)
+            if key in cfg.connectivity_maps:
+                block.attn.set_processor(Flux2BlockSparseSelfAttnProcessor(cfg, bi))
+                sparse_single += 1
+            else:
+                block.attn.set_processor(Flux2ParallelSelfAttnProcessor())
+
+        logger.info(
+            f"Block-sparse attention installed on {sparse_double} double-stream "
+            f"and {sparse_single} single-stream blocks "
+            f"(timestep_threshold={timestep_threshold}, block_size={block_size})."
+        )
+
+    def disable_block_sparse_attention(self) -> None:
+        """Restore all attention processors to standard dense SDPA.
+
+        Disables block-sparse attention and resets the shared config.
+        """
+        self._block_sparse_config.enabled = False
+        self._block_sparse_config.connectivity_maps = {}
+
+        for block in self.transformer_blocks:
+            block.attn.set_processor(Flux2AttnProcessor())
+        for block in self.single_transformer_blocks:
+            block.attn.set_processor(Flux2ParallelSelfAttnProcessor())
+
+        logger.info("Block-sparse attention disabled. Standard processors restored.")
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1317,6 +1660,14 @@ class Flux2Transformer2DModel(
         if profiling_store.enabled:
             # Store the normalized timestep (before the ×1000 scaling)
             profiling_store.current_timestep = timestep.item() if timestep.numel() == 1 else timestep[0].item()
+
+        # Update block-sparse config with the current normalised timestep so that
+        # processors can gate their sparse path based on the denoising progress.
+        block_sparse_cfg = self._block_sparse_config
+        if block_sparse_cfg.enabled:
+            block_sparse_cfg.current_timestep = (
+                timestep.item() if timestep.numel() == 1 else timestep[0].item()
+            )
 
         # 1. Calculate timestep embedding and modulation parameters
         timestep = timestep.to(hidden_states.dtype) * 1000
