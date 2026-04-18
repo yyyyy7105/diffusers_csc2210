@@ -181,7 +181,14 @@ tags
 wandb
 
 # images
-*.png
+# *.png
+# *.gif
+
+# model files
+*.pt
 
 # Profiler Logs
 log/
+
+# whl
+*.whl

@@ -15,16 +15,20 @@
 import inspect
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import os
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attn import flash_attn_func
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FluxTransformer2DLoadersMixin, FromOriginalModelMixin, PeftAdapterMixin
 from ...utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
 from .._modeling_parallel import ContextParallelInput, ContextParallelOutput
 from ..attention import AttentionMixin, AttentionModuleMixin
-from ..attention_dispatch import dispatch_attention_fn
+from ..attention_dispatch import dispatch_attention_fn, AttentionBackendName
 from ..cache_utils import CacheMixin
 from ..embeddings import (
     TimestepEmbedding,
@@ -112,6 +116,148 @@ class Flux2FeedForward(nn.Module):
         return x
 
 
+class BlockRadiusSchedule:
+    """Base class for dynamic block radius schedules.
+
+    Subclass and implement ``__call__(step, total_steps) -> Optional[int]``.
+    Return ``None`` to disable blocking for that step.
+    """
+
+    def __call__(self, step: int, total_steps: int) -> Optional[int]:
+        raise NotImplementedError
+
+
+class LinearBlockRadius(BlockRadiusSchedule):
+    """Linearly interpolate radius from ``start`` to ``end`` over all steps."""
+
+    def __init__(self, start: int, end: int):
+        self.start = start
+        self.end = end
+
+    def __call__(self, step: int, total_steps: int) -> int:
+        t = step / max(total_steps - 1, 1)
+        return round(self.start + t * (self.end - self.start))
+
+    def __str__(self) -> str:
+        return f"LinearBlockRadius(start={self.start}, end={self.end})"
+
+
+class StepBlockRadius(BlockRadiusSchedule):
+    """No blocking for early steps; fixed radius once ``start_step`` is reached."""
+
+    def __init__(self, start_step: int, radius: int):
+        self.start_step = start_step
+        self.radius = radius
+
+    def __call__(self, step: int, total_steps: int) -> Optional[int]:
+        return self.radius if step >= self.start_step else None
+
+    def __str__(self) -> str:
+        return f"StepBlockRadius(start_step={self.start_step}, radius={self.radius})"
+
+
+class AttnStore:
+    """Class-level singleton shared between all attention processors.
+
+    Set ``enabled = True`` before a forward pass to accumulate per-block
+    image self-attention maps; call ``reset()`` to clear between steps.
+    Call ``set_block_radius(int | None)`` to restrict image attention to a
+    local Chebyshev window; the pipeline resolves any BlockRadiusSchedule
+    to a plain int before calling this method.
+    Read the current radius via ``block_radius`` (always int or None).
+    """
+
+    enabled: bool = False
+    use_z_order: bool = False             # if True, reorder image tokens by Morton code before sliding window (gives 2D block-like pattern; False gives horizontal stripes)
+    use_exact_chebyshev_mask: bool = False  # if True, Pass 2 uses exact Chebyshev float mask + manual softmax instead of FA2 sliding window
+    _block_radius: Optional[int] = None  # always a resolved int; use set_block_radius() to write
+    num_txt_tokens: int = 0
+    img_ids: Optional[torch.Tensor] = None  # (Seq_img, 4) – [t, row, col, layer]
+    _maps: list = []
+    _cached_mask: Optional[torch.Tensor] = None   # cached float mask, reused across blocks
+    _cache_key: tuple = ()                         # (radius, num_txt, seq_total, device, dtype)
+    _cached_z_sort:   Optional[torch.Tensor] = None  # Z-order sort indices (CPU)
+    _cached_z_unsort: Optional[torch.Tensor] = None  # Z-order unsort indices (CPU)
+    _cached_z_key:    Optional[int] = None            # = img_ids.shape[0]
+
+    @classmethod
+    def set_block_radius(cls, radius: Optional[int]) -> None:
+        """Set the resolved block radius and invalidate float mask cache if changed."""
+        if cls._block_radius != radius:
+            cls._block_radius = radius
+            cls._cached_mask = None
+            cls._cache_key = ()
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._maps = []
+
+    @classmethod
+    def add(cls, attn_map: torch.Tensor) -> None:
+        """Append a (Seq_img, Seq_img) cpu tensor."""
+        cls._maps.append(attn_map)
+
+    @classmethod
+    def get_maps(cls) -> list:
+        return list(cls._maps)
+
+
+def _make_blocked_mask(
+    img_ids: torch.Tensor,
+    radius: int,
+    num_txt: int,
+    seq_total: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return an additive attention mask (Seq_total, Seq_total).
+
+    Image-to-image pairs whose Chebyshev distance exceeds *radius* are set
+    to ``-inf`` so they vanish after softmax.  All other entries are 0.
+    The result is cached in AttnStore and reused across all block calls
+    within the same forward pass (img_ids/radius/shape are constant).
+    """
+    cache_key = (radius, num_txt, seq_total, device, dtype)
+    if AttnStore._cached_mask is not None and AttnStore._cache_key == cache_key:
+        return AttnStore._cached_mask
+
+    rows = img_ids[:, 1].float()  # (Seq_img,)
+    cols = img_ids[:, 2].float()
+    dr = (rows.unsqueeze(0) - rows.unsqueeze(1)).abs()  # (Seq_img, Seq_img)
+    dc = (cols.unsqueeze(0) - cols.unsqueeze(1)).abs()
+    blocked = (dr > radius) | (dc > radius)
+    # breakpoint()
+    mask = torch.zeros(seq_total, seq_total, device=device, dtype=dtype)
+    mask[num_txt:, num_txt:].masked_fill_(blocked, float("-inf"))
+
+    AttnStore._cached_mask = mask
+    AttnStore._cache_key = cache_key
+    return mask
+
+def _morton_sort_indices(img_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Z-order (Morton code) sort and unsort indices for image tokens.
+
+    Returns (sort_idx, unsort_idx) on CPU:
+    - sort_idx[i]   = original token index occupying Z-order position i
+    - unsort_idx[i] = Z-order position of original token i
+    Derived from img_ids[:, 1] (row) and img_ids[:, 2] (col).
+    """
+    rows = img_ids[:, 1].long()
+    cols = img_ids[:, 2].long()
+
+    def spread_bits(x: torch.Tensor) -> torch.Tensor:
+        x = (x | (x << 8)) & 0x00FF00FF
+        x = (x | (x << 4)) & 0x0F0F0F0F
+        x = (x | (x << 2)) & 0x33333333
+        x = (x | (x << 1)) & 0x55555555
+        return x
+
+    codes = spread_bits(rows) | (spread_bits(cols) << 1)
+    sort_idx   = torch.argsort(codes)
+    unsort_idx = torch.argsort(sort_idx)
+    return sort_idx, unsort_idx
+
+
 class Flux2AttnProcessor:
     _attention_backend = None
     _parallel_config = None
@@ -152,17 +298,96 @@ class Flux2AttnProcessor:
             value = torch.cat([encoder_value, value], dim=1)
 
         if image_rotary_emb is not None:
-            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)  # type: ignore[assignment]
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)  # type: ignore[assignment]
 
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+        num_txt = AttnStore.num_txt_tokens
+
+        # --- Image self-attention heatmap capture (reflects blocking when active) ---
+        if AttnStore.enabled and query.shape[1] > num_txt:
+            with torch.no_grad():
+                q_img = query[:, num_txt:].transpose(1, 2)  # (B, H, Seq_img, D)
+                k_img = key[:, num_txt:].transpose(1, 2)
+                scores = torch.matmul(q_img, k_img.transpose(-1, -2)) / math.sqrt(q_img.size(-1))
+                if AttnStore._block_radius is not None and AttnStore.img_ids is not None:
+                    # Apply float mask so heatmap shows blocked attention
+                    blocked_mask = _make_blocked_mask(
+                        AttnStore.img_ids, AttnStore._block_radius,
+                        num_txt, query.shape[1], query.device, query.dtype,
+                    )
+                    scores = scores + blocked_mask[num_txt:, num_txt:].unsqueeze(0).unsqueeze(0)
+                probs = torch.softmax(scores, dim=-1).mean(dim=(0, 1))  # (Seq_img, Seq_img)
+                AttnStore.add(probs.cpu())
+                del q_img, k_img, scores, probs
+
+        if AttnStore._block_radius is not None and query.shape[1] > num_txt and num_txt > 0:
+            q_txt = query[:, :num_txt];  q_img = query[:, num_txt:]
+            k_txt = key[:,   :num_txt];  k_img = key[:,   num_txt:]
+            v_txt = value[:, :num_txt];  v_img = value[:, num_txt:]
+
+            # Pass 1: image × text — full cross-attention (image sees all text tokens)
+            out_img_txt, lse_txt, _ = flash_attn_func(q_img, k_txt, v_txt, return_attn_probs=True)
+
+            # Pass 2: image × image
+            if AttnStore.use_exact_chebyshev_mask and AttnStore.img_ids is not None:
+                # Exact Chebyshev masking via manual softmax — no FLOPs savings, but exact coverage
+                blocked_mask = _make_blocked_mask(
+                    AttnStore.img_ids, AttnStore._block_radius,
+                    num_txt, query.shape[1], query.device, query.dtype,
+                )
+                img_img_mask = blocked_mask[num_txt:, num_txt:]
+                scale = 1.0 / math.sqrt(q_img.shape[-1])
+                q_t = q_img.transpose(1, 2)
+                k_t = k_img.transpose(1, 2)
+                v_t = v_img.transpose(1, 2)
+                scores = torch.matmul(q_t, k_t.transpose(-1, -2)) * scale + img_img_mask
+                lse_img_w = torch.logsumexp(scores, dim=-1)   # (B, H, num_img)
+                out_img_w = torch.matmul(torch.softmax(scores, dim=-1), v_t).transpose(1, 2)
+            else:
+                # FA2 sliding window (approximate Chebyshev, skips blocked Q@K^T)
+                W_img = int(math.isqrt(query.shape[1] - num_txt))
+                if AttnStore.use_z_order and AttnStore.img_ids is not None:
+                    z_key = AttnStore.img_ids.shape[0]
+                    if AttnStore._cached_z_sort is None or AttnStore._cached_z_key != z_key:
+                        sort_idx, unsort_idx = _morton_sort_indices(AttnStore.img_ids)
+                        AttnStore._cached_z_sort   = sort_idx
+                        AttnStore._cached_z_unsort = unsort_idx
+                        AttnStore._cached_z_key    = z_key
+                    sort_idx   = AttnStore._cached_z_sort.to(query.device)
+                    unsort_idx = AttnStore._cached_z_unsort.to(query.device)
+                    q_img_w = q_img[:, sort_idx]
+                    k_img_w = k_img[:, sort_idx]
+                    v_img_w = v_img[:, sort_idx]
+                    window = (2 * AttnStore._block_radius + 1) ** 2
+                else:
+                    q_img_w, k_img_w, v_img_w = q_img, k_img, v_img
+                    unsort_idx = None
+                    window = AttnStore._block_radius * (W_img + 1)
+
+                out_img_w, lse_img_w, _ = flash_attn_func(
+                    q_img_w, k_img_w, v_img_w, window_size=(window, window), return_attn_probs=True,
+                )
+                if unsort_idx is not None:
+                    out_img_w  = out_img_w[:, unsort_idx]
+                    lse_img_w  = lse_img_w[:, :, unsort_idx]
+
+            # Exact combination via log-sum-exp
+            lse_combined = torch.logaddexp(lse_txt, lse_img_w)
+            w_txt = torch.exp(lse_txt  - lse_combined).permute(0, 2, 1).unsqueeze(-1)
+            w_img = torch.exp(lse_img_w - lse_combined).permute(0, 2, 1).unsqueeze(-1)
+            out_img = w_txt * out_img_txt + w_img * out_img_w  # (B, num_img, H, D)
+
+            # Pass 3: text × all — full attention (text sees everything)
+            out_txt = flash_attn_func(q_txt, key, value)
+
+            hidden_states = torch.cat([out_txt, out_img], dim=1)  # (B, seq_total, H, D)
+        else:
+            hidden_states = dispatch_attention_fn(
+                query, key, value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -288,17 +513,96 @@ class Flux2ParallelSelfAttnProcessor:
         key = attn.norm_k(key)
 
         if image_rotary_emb is not None:
-            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)  # type: ignore[assignment]
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)  # type: ignore[assignment]
 
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+        num_txt = AttnStore.num_txt_tokens
+
+        # --- Image self-attention heatmap capture (reflects blocking when active) ---
+        if AttnStore.enabled and query.shape[1] > num_txt:
+            with torch.no_grad():
+                q_img = query[:, num_txt:].transpose(1, 2)  # (B, H, Seq_img, D)
+                k_img = key[:, num_txt:].transpose(1, 2)
+                scores = torch.matmul(q_img, k_img.transpose(-1, -2)) / math.sqrt(q_img.size(-1))
+                if AttnStore._block_radius is not None and AttnStore.img_ids is not None:
+                    # Apply float mask so heatmap shows blocked attention
+                    blocked_mask = _make_blocked_mask(
+                        AttnStore.img_ids, AttnStore._block_radius,
+                        num_txt, query.shape[1], query.device, query.dtype,
+                    )
+                    scores = scores + blocked_mask[num_txt:, num_txt:].unsqueeze(0).unsqueeze(0)
+                probs = torch.softmax(scores, dim=-1).mean(dim=(0, 1))  # (Seq_img, Seq_img)
+                AttnStore.add(probs.cpu())
+                del q_img, k_img, scores, probs
+
+        if AttnStore._block_radius is not None and query.shape[1] > num_txt and num_txt > 0:
+            q_txt = query[:, :num_txt];  q_img = query[:, num_txt:]
+            k_txt = key[:,   :num_txt];  k_img = key[:,   num_txt:]
+            v_txt = value[:, :num_txt];  v_img = value[:, num_txt:]
+
+            # Pass 1: image × text — full cross-attention (image sees all text tokens)
+            out_img_txt, lse_txt, _ = flash_attn_func(q_img, k_txt, v_txt, return_attn_probs=True)
+
+            # Pass 2: image × image
+            if AttnStore.use_exact_chebyshev_mask and AttnStore.img_ids is not None:
+                # Exact Chebyshev masking via manual softmax — no FLOPs savings, but exact coverage
+                blocked_mask = _make_blocked_mask(
+                    AttnStore.img_ids, AttnStore._block_radius,
+                    num_txt, query.shape[1], query.device, query.dtype,
+                )
+                img_img_mask = blocked_mask[num_txt:, num_txt:]
+                scale = 1.0 / math.sqrt(q_img.shape[-1])
+                q_t = q_img.transpose(1, 2)
+                k_t = k_img.transpose(1, 2)
+                v_t = v_img.transpose(1, 2)
+                scores = torch.matmul(q_t, k_t.transpose(-1, -2)) * scale + img_img_mask
+                lse_img_w = torch.logsumexp(scores, dim=-1)   # (B, H, num_img)
+                out_img_w = torch.matmul(torch.softmax(scores, dim=-1), v_t).transpose(1, 2)
+            else:
+                # FA2 sliding window (approximate Chebyshev, skips blocked Q@K^T)
+                W_img = int(math.isqrt(query.shape[1] - num_txt))
+                if AttnStore.use_z_order and AttnStore.img_ids is not None:
+                    z_key = AttnStore.img_ids.shape[0]
+                    if AttnStore._cached_z_sort is None or AttnStore._cached_z_key != z_key:
+                        sort_idx, unsort_idx = _morton_sort_indices(AttnStore.img_ids)
+                        AttnStore._cached_z_sort   = sort_idx
+                        AttnStore._cached_z_unsort = unsort_idx
+                        AttnStore._cached_z_key    = z_key
+                    sort_idx   = AttnStore._cached_z_sort.to(query.device)
+                    unsort_idx = AttnStore._cached_z_unsort.to(query.device)
+                    q_img_w = q_img[:, sort_idx]
+                    k_img_w = k_img[:, sort_idx]
+                    v_img_w = v_img[:, sort_idx]
+                    window = (2 * AttnStore._block_radius + 1) ** 2
+                else:
+                    q_img_w, k_img_w, v_img_w = q_img, k_img, v_img
+                    unsort_idx = None
+                    window = AttnStore._block_radius * (W_img + 1)
+
+                out_img_w, lse_img_w, _ = flash_attn_func(
+                    q_img_w, k_img_w, v_img_w, window_size=(window, window), return_attn_probs=True,
+                )
+                if unsort_idx is not None:
+                    out_img_w  = out_img_w[:, unsort_idx]
+                    lse_img_w  = lse_img_w[:, :, unsort_idx]
+
+            # Exact combination via log-sum-exp
+            lse_combined = torch.logaddexp(lse_txt, lse_img_w)
+            w_txt = torch.exp(lse_txt  - lse_combined).permute(0, 2, 1).unsqueeze(-1)
+            w_img = torch.exp(lse_img_w - lse_combined).permute(0, 2, 1).unsqueeze(-1)
+            out_img = w_txt * out_img_txt + w_img * out_img_w  # (B, num_img, H, D)
+
+            # Pass 3: text × all — full attention (text sees everything)
+            out_txt = flash_attn_func(q_txt, key, value)
+
+            hidden_states = torch.cat([out_txt, out_img], dim=1)  # (B, seq_total, H, D)
+        else:
+            hidden_states = dispatch_attention_fn(
+                query, key, value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -826,6 +1130,7 @@ class Flux2Transformer2DModel(
                 )
 
         num_txt_tokens = encoder_hidden_states.shape[1]
+        AttnStore.num_txt_tokens = num_txt_tokens
 
         # 1. Calculate timestep embedding and modulation parameters
         timestep = timestep.to(hidden_states.dtype) * 1000
@@ -850,6 +1155,7 @@ class Flux2Transformer2DModel(
             img_ids = img_ids[0]
         if txt_ids.ndim == 3:
             txt_ids = txt_ids[0]
+        AttnStore.img_ids = img_ids
 
         image_rotary_emb = self.pos_embed(img_ids)
         text_rotary_emb = self.pos_embed(txt_ids)
