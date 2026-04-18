@@ -181,8 +181,8 @@ tags
 wandb
 
 # images
-*.png
-*.gif
+# *.png
+# *.gif
 
 # model files
 *.pt
